@@ -27,11 +27,13 @@ import os
 import re
 import sys
 import uuid
+import secrets
 import sqlite3
 import platform
+import threading
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QRect, QDate, QPropertyAnimation, QEasingCurve
+from PySide6.QtCore import Qt, QRect, QDate, QObject, Signal, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -63,9 +65,8 @@ LEGACY_BOARD_NAME = "Default"
 # reasoned about on its own).
 # ---------------------------------------------------------------------------
 
-def get_db_path() -> str:
-    """Return the OS-appropriate path to the SQLite database file,
-    creating the containing directory if needed."""
+def get_data_dir() -> str:
+    """Return the OS-appropriate app data directory, creating it if needed."""
     system = platform.system()
     if system == "Windows":
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
@@ -75,6 +76,13 @@ def get_db_path() -> str:
         data_dir = os.path.join(base, "kanban_board")
 
     os.makedirs(data_dir, exist_ok=True)
+    return data_dir
+
+
+def get_db_path() -> str:
+    """Return the OS-appropriate path to the SQLite database file,
+    creating the containing directory if needed."""
+    data_dir = get_data_dir()
     return os.path.join(data_dir, "kanban.db")
 
 
@@ -785,6 +793,195 @@ class TaskCardDialog(QDialog):
         }
 
 
+class NewTaskDialog(QDialog):
+    """Single-form task creation dialog, styled and laid out like
+    TaskCardDialog's edit form (title/status/due date/Joplin link/notes)
+    instead of the sequence of plain input-box prompts this replaced."""
+
+    def __init__(self, columns: list, default_status: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("New Task")
+        self.resize(420, 420)
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("Title"))
+        self.title_edit = QLineEdit()
+        layout.addWidget(self.title_edit)
+
+        layout.addWidget(QLabel("Status"))
+        self.status_combo = QComboBox()
+        for col in columns:
+            self.status_combo.addItem(col["name"], col["status"])
+        default_idx = next(
+            (i for i, col in enumerate(columns) if col["status"] == default_status), 0
+        )
+        self.status_combo.setCurrentIndex(default_idx)
+        layout.addWidget(self.status_combo)
+
+        layout.addWidget(QLabel("Due Date"))
+        due_row = QHBoxLayout()
+        self.due_date_check = QCheckBox("Set")
+        due_row.addWidget(self.due_date_check)
+        self.due_date_edit = QDateEdit()
+        self.due_date_edit.setCalendarPopup(True)
+        self.due_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.due_date_edit.setDate(QDate.currentDate())
+        self.due_date_edit.setEnabled(False)
+        self.due_date_check.toggled.connect(self.due_date_edit.setEnabled)
+        due_row.addWidget(self.due_date_edit, stretch=1)
+        layout.addLayout(due_row)
+
+        layout.addWidget(QLabel("Joplin Note Link"))
+        self.joplin_link_edit = QLineEdit()
+        self.joplin_link_edit.setPlaceholderText("joplin://... or https://...")
+        layout.addWidget(self.joplin_link_edit)
+
+        layout.addWidget(QLabel("Notes"))
+        self.notes_edit = QTextEdit()
+        layout.addWidget(self.notes_edit, stretch=1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        add_btn = QPushButton("Add Task")
+        add_btn.setProperty("accent", True)
+        add_btn.setDefault(True)
+        add_btn.clicked.connect(self.accept)
+        btn_row.addWidget(add_btn)
+        layout.addLayout(btn_row)
+
+        self.title_edit.setFocus()
+
+    def result_values(self) -> dict:
+        due_date = self.due_date_edit.date().toString("yyyy-MM-dd") if self.due_date_check.isChecked() else ""
+        return {
+            "title": self.title_edit.text().strip(),
+            "notes": self.notes_edit.toPlainText().strip(),
+            "status": self.status_combo.currentData(),
+            "due_date": due_date,
+            "joplin_link": self.joplin_link_edit.text().strip(),
+        }
+
+
+class QuickAddDialog(QDialog):
+    """Popped up by the global Ctrl+Space shortcut, from anywhere, so it
+    needs its own board picker (unlike NewTaskDialog, which always targets
+    whichever board is currently open). Tasks are written straight to the
+    database as they're added rather than being held for a bulk save, so
+    "Create multiple" can add several without losing what's already been
+    committed if the dialog is dismissed midway."""
+
+    def __init__(self, conn: sqlite3.Connection, boards: list, current_board_id: str, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.added_board_ids = set()
+        self.setWindowTitle("Quick Add Task")
+        self.resize(420, 460)
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("Board"))
+        self.board_combo = QComboBox()
+        for b in boards:
+            self.board_combo.addItem(b["name"], b["id"])
+        default_idx = next((i for i, b in enumerate(boards) if b["id"] == current_board_id), 0)
+        self.board_combo.setCurrentIndex(default_idx)
+        self.board_combo.currentIndexChanged.connect(self._reload_statuses)
+        layout.addWidget(self.board_combo)
+
+        layout.addWidget(QLabel("Title"))
+        self.title_edit = QLineEdit()
+        layout.addWidget(self.title_edit)
+
+        layout.addWidget(QLabel("Status"))
+        self.status_combo = QComboBox()
+        layout.addWidget(self.status_combo)
+
+        layout.addWidget(QLabel("Due Date"))
+        due_row = QHBoxLayout()
+        self.due_date_check = QCheckBox("Set")
+        due_row.addWidget(self.due_date_check)
+        self.due_date_edit = QDateEdit()
+        self.due_date_edit.setCalendarPopup(True)
+        self.due_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.due_date_edit.setDate(QDate.currentDate())
+        self.due_date_edit.setEnabled(False)
+        self.due_date_check.toggled.connect(self.due_date_edit.setEnabled)
+        due_row.addWidget(self.due_date_edit, stretch=1)
+        layout.addLayout(due_row)
+
+        layout.addWidget(QLabel("Joplin Note Link"))
+        self.joplin_link_edit = QLineEdit()
+        self.joplin_link_edit.setPlaceholderText("joplin://... or https://...")
+        layout.addWidget(self.joplin_link_edit)
+
+        layout.addWidget(QLabel("Notes"))
+        self.notes_edit = QTextEdit()
+        layout.addWidget(self.notes_edit, stretch=1)
+
+        btn_row = QHBoxLayout()
+        self.multiple_check = QCheckBox("Create multiple")
+        self.multiple_check.setToolTip("Keep this dialog open to add another task after each Add")
+        btn_row.addWidget(self.multiple_check)
+        btn_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        add_btn = QPushButton("Add Task")
+        add_btn.setProperty("accent", True)
+        add_btn.setDefault(True)
+        add_btn.clicked.connect(self._on_add)
+        btn_row.addWidget(add_btn)
+        layout.addLayout(btn_row)
+
+        self._reload_statuses()
+        self.title_edit.setFocus()
+
+    def _reload_statuses(self) -> None:
+        board_id = self.board_combo.currentData()
+        columns = get_columns(self.conn, board_id)
+        default_status = get_default_new_task_status(self.conn, board_id)
+        self.status_combo.clear()
+        for col in columns:
+            self.status_combo.addItem(col["name"], col["status"])
+        default_idx = next((i for i, col in enumerate(columns) if col["status"] == default_status), 0)
+        if columns:
+            self.status_combo.setCurrentIndex(default_idx)
+
+    def _on_add(self) -> None:
+        title = self.title_edit.text().strip()
+        if not title:
+            QMessageBox.warning(self, "Title required", "Task title cannot be empty.")
+            return
+        board_id = self.board_combo.currentData()
+        status = self.status_combo.currentData()
+        if not status:
+            QMessageBox.information(self, "No columns", "That board has no columns to add a task to.")
+            return
+
+        notes = self.notes_edit.toPlainText().strip()
+        due_date = self.due_date_edit.date().toString("yyyy-MM-dd") if self.due_date_check.isChecked() else ""
+        joplin_link = self.joplin_link_edit.text().strip()
+
+        task = add_task(self.conn, board_id, title, notes, status)
+        if due_date or joplin_link:
+            update_task(self.conn, task["id"], title, notes, due_date, joplin_link)
+        self.added_board_ids.add(board_id)
+
+        if self.multiple_check.isChecked():
+            self.title_edit.clear()
+            self.notes_edit.clear()
+            self.joplin_link_edit.clear()
+            self.due_date_check.setChecked(False)
+            self.title_edit.setFocus()
+        else:
+            self.accept()
+
+
 class TaskListWidget(QListWidget):
     """A QListWidget that accepts drops only from another TaskListWidget on
     the SAME board (columns belonging to a different board are never shown
@@ -1050,6 +1247,7 @@ class KanbanBoard(QWidget):
         self._columns_cache = []   # last-fetched column dicts for the current board
         self._board_panel_open = False
         self._board_panel_anim = None
+        self._quick_add_dialog = None
 
         outer = QVBoxLayout(self)
 
@@ -1267,11 +1465,23 @@ class KanbanBoard(QWidget):
         if not self._columns_cache:
             QMessageBox.information(self, "No columns", "Add a column first.")
             return
-        title, ok = QInputDialog.getText(self, "New Task", "Title:")
-        if not ok or not title.strip():
+
+        default_status = get_default_new_task_status(self.conn, self.current_board_id)
+        dialog = NewTaskDialog(self._columns_cache, default_status, self)
+        if dialog.exec() != QDialog.Accepted:
             return
-        notes, ok2 = QInputDialog.getMultiLineText(self, "New Task", "Notes (optional):", "")
-        add_task(self.conn, self.current_board_id, title.strip(), notes.strip() if ok2 else "")
+
+        values = dialog.result_values()
+        if not values["title"]:
+            QMessageBox.warning(self, "Title required", "Task title cannot be empty.")
+            return
+
+        task = add_task(self.conn, self.current_board_id, values["title"], values["notes"], values["status"])
+        if values["due_date"] or values["joplin_link"]:
+            update_task(
+                self.conn, task["id"], values["title"], values["notes"],
+                values["due_date"], values["joplin_link"],
+            )
         self.refresh()
 
     def edit_task(self, task_id: str) -> None:
@@ -1420,6 +1630,200 @@ class KanbanBoard(QWidget):
         self.rebuild_boards_selector(preferred_board_id=self.current_board_id)
         self._sync_board_panel()
 
+    # -- global quick-add shortcut (Ctrl+Space) ---------------------------
+
+    def show_quick_add_dialog(self) -> None:
+        """Slot for GlobalShortcutBridge.triggered. May be invoked while
+        the window is minimized or unfocused, so it brings the window to
+        the front itself rather than assuming it's already visible."""
+        if self._quick_add_dialog is not None:
+            self._quick_add_dialog.raise_()
+            self._quick_add_dialog.activateWindow()
+            return
+
+        boards = get_boards(self.conn)
+        if not boards:
+            return
+
+        top = self.window()
+        top.show()
+        top.raise_()
+        top.activateWindow()
+
+        dialog = QuickAddDialog(self.conn, boards, self.current_board_id, self)
+        self._quick_add_dialog = dialog
+        dialog.exec()
+        self._quick_add_dialog = None
+
+        if self.current_board_id in dialog.added_board_ids:
+            self.refresh()
+
+
+# ---------------------------------------------------------------------------
+# Global "quick add" hotkey (Ctrl+Space) - works even while Kanvas isn't the
+# foreground window. There's no cross-platform way to grab a global hotkey,
+# so this is two separate best-effort backends; if neither can set up
+# (unsupported desktop, missing libraries, key already taken) Kanvas just
+# runs without the shortcut instead of failing to start.
+# ---------------------------------------------------------------------------
+
+QUICK_ADD_SHORTCUT_ID = "quick-add-task"
+QUICK_ADD_SHORTCUT_DESCRIPTION = "Quick-add a Kanvas task"
+
+
+class GlobalShortcutBridge(QObject):
+    """The platform backends run on a background thread and must never
+    touch widgets directly, so they only ever call emit() here. Since this
+    QObject is created on and lives on the GUI thread, PySide queues the
+    delivery of `triggered` onto the GUI thread's event loop automatically,
+    even though emit() itself is called from the background thread."""
+    triggered = Signal()
+
+
+def _start_linux_global_shortcut(bridge: GlobalShortcutBridge) -> threading.Thread:
+    """Registers Ctrl+Space via the XDG Desktop Portal GlobalShortcuts
+    interface - the only sanctioned way to get a global hotkey under
+    Wayland (raw-input libraries like pynput/keyboard don't work there).
+    The first time this runs for a given app, the compositor may open its
+    own shortcut-settings UI for the user to confirm/assign the key; once
+    assigned it's remembered for future launches (BindShortcuts then comes
+    back with a non-empty trigger_description and ConfigureShortcuts is
+    skipped). Runs entirely on a background thread with its own GLib main
+    loop, since dbus-python's signal delivery needs a running main loop."""
+    import dbus
+    from dbus.mainloop.glib import DBusGMainLoop
+    from gi.repository import GLib
+
+    def worker():
+        DBusGMainLoop(set_as_default=True)
+        bus = dbus.SessionBus()
+        loop = GLib.MainLoop()
+        sender_token = bus.get_unique_name()[1:].replace(".", "_")
+
+        portal = bus.get_object("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop")
+        shortcuts_iface = dbus.Interface(portal, "org.freedesktop.portal.GlobalShortcuts")
+
+        def request_path(token):
+            return f"/org/freedesktop/portal/desktop/request/{sender_token}/{token}"
+
+        def on_activated(session_handle, shortcut_id, timestamp, options):
+            if str(shortcut_id) == QUICK_ADD_SHORTCUT_ID:
+                bridge.triggered.emit()
+
+        shortcuts_iface.connect_to_signal("Activated", on_activated)
+
+        def on_configure_response(response, results):
+            pass
+
+        def on_bind_response(response, results):
+            if response != 0:
+                return
+            for shortcut_id, info in results.get("shortcuts") or []:
+                already_assigned = bool(str(info.get("trigger_description", "")))
+                if str(shortcut_id) == QUICK_ADD_SHORTCUT_ID and not already_assigned:
+                    configure_token = f"configure_{secrets.token_hex(4)}"
+                    bus.add_signal_receiver(
+                        on_configure_response,
+                        signal_name="Response",
+                        dbus_interface="org.freedesktop.portal.Request",
+                        path=request_path(configure_token),
+                    )
+                    shortcuts_iface.ConfigureShortcuts(
+                        session_handle, "",
+                        dbus.Dictionary({dbus.String("handle_token"): dbus.String(configure_token)}, signature="sv"),
+                    )
+
+        session_handle = None
+
+        def on_session_response(response, results):
+            nonlocal session_handle
+            if response != 0:
+                return
+            session_handle = str(results["session_handle"])
+
+            shortcuts = dbus.Array([
+                dbus.Struct((
+                    dbus.String(QUICK_ADD_SHORTCUT_ID),
+                    dbus.Dictionary(
+                        {dbus.String("description"): dbus.String(QUICK_ADD_SHORTCUT_DESCRIPTION)}, signature="sv"
+                    ),
+                ), signature="sa{sv}")
+            ], signature="(sa{sv})")
+
+            bind_token = f"bind_{secrets.token_hex(4)}"
+            bus.add_signal_receiver(
+                on_bind_response,
+                signal_name="Response",
+                dbus_interface="org.freedesktop.portal.Request",
+                path=request_path(bind_token),
+            )
+            shortcuts_iface.BindShortcuts(
+                session_handle, shortcuts, "",
+                dbus.Dictionary({dbus.String("handle_token"): dbus.String(bind_token)}, signature="sv"),
+            )
+
+        create_token = f"create_{secrets.token_hex(4)}"
+        bus.add_signal_receiver(
+            on_session_response,
+            signal_name="Response",
+            dbus_interface="org.freedesktop.portal.Request",
+            path=request_path(create_token),
+        )
+        shortcuts_iface.CreateSession(dbus.Dictionary({
+            dbus.String("handle_token"): dbus.String(create_token),
+            dbus.String("session_handle_token"): dbus.String(f"session_{secrets.token_hex(4)}"),
+        }, signature="sv"))
+
+        loop.run()
+
+    thread = threading.Thread(target=worker, daemon=True, name="kanvas-global-shortcut")
+    thread.start()
+    return thread
+
+
+def _start_windows_global_shortcut(bridge: GlobalShortcutBridge) -> threading.Thread:
+    """Registers Ctrl+Space as a systemwide hotkey via the Win32
+    RegisterHotKey API. Windows has no Wayland-style sandboxing around
+    this, so it's just a thread-message loop and no user confirmation
+    step is needed. RegisterHotKey/GetMessage must run on the same
+    thread, so the whole thing lives in one background-thread worker."""
+    import ctypes
+    from ctypes import wintypes
+
+    MOD_CONTROL = 0x0002
+    VK_SPACE = 0x20
+    WM_HOTKEY = 0x0312
+    HOTKEY_ID = 1
+
+    def worker():
+        user32 = ctypes.windll.user32
+        if not user32.RegisterHotKey(None, HOTKEY_ID, MOD_CONTROL, VK_SPACE):
+            return
+        try:
+            msg = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
+                    bridge.triggered.emit()
+        finally:
+            user32.UnregisterHotKey(None, HOTKEY_ID)
+
+    thread = threading.Thread(target=worker, daemon=True, name="kanvas-global-shortcut")
+    thread.start()
+    return thread
+
+
+def start_global_shortcut(bridge: GlobalShortcutBridge):
+    """Best-effort setup; failures are logged and swallowed rather than
+    crashing the app; Kanvas is fully usable without the shortcut."""
+    try:
+        if platform.system() == "Windows":
+            return _start_windows_global_shortcut(bridge)
+        else:
+            return _start_linux_global_shortcut(bridge)
+    except Exception as e:
+        print(f"Quick-add global shortcut unavailable: {e}", file=sys.stderr)
+        return None
+
 
 def main():
     db_path = get_db_path()
@@ -1439,6 +1843,10 @@ def main():
     window.setCentralWidget(board)
     window.resize(1150, 640)
     window.show()
+
+    board.shortcut_bridge = GlobalShortcutBridge()
+    board.shortcut_bridge.triggered.connect(board.show_quick_add_dialog)
+    board.shortcut_thread = start_global_shortcut(board.shortcut_bridge)
 
     exit_code = app.exec()
     conn.close()
