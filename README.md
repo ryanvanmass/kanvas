@@ -13,6 +13,7 @@
 - Add, rename, reorder, and delete columns (behind an "Edit Board" mode)
 - Add, rename, reorder, and delete boards from the side panel (hamburger menu)
 - Tasks support notes, an optional due date, subtasks, and an optional link (e.g. a Joplin note)
+- Global `Ctrl+Space` hotkey opens a quick-add dialog (with a board picker and a "Create multiple" option) from anywhere, even while Kanvas isn't focused
 - Data is stored locally in a SQLite database — no account or internet connection required
 
 ## Requirements
@@ -43,6 +44,14 @@ Kanvas keeps its SQLite database outside the project folder, so your tasks persi
 |---------|--------------------------------------------|
 | Linux   | `~/.local/share/kanban_board/kanban.db`    |
 | Windows | `%APPDATA%\KanbanBoard\kanban.db`          |
+
+## Global quick-add hotkey
+
+Pressing `Ctrl+Space` anywhere opens a quick-add dialog, regardless of whether Kanvas is the focused window.
+
+- **Windows**: works out of the box via the Win32 `RegisterHotKey` API — no setup, no extra dependency.
+- **Linux**: registered through the [XDG Desktop Portal `GlobalShortcuts`](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html) interface, since Wayland doesn't let apps grab keys directly. This needs a portal backend that implements it (KDE Plasma does; check your desktop's support if the hotkey doesn't respond) plus the `dbus-python` and `PyGObject` (`gi`) packages — both are already preinstalled on most KDE systems. The very first launch may open your desktop's shortcut settings for you to confirm the key; after that it's remembered.
+- If neither backend can set up (missing libraries, unsupported desktop, the key already bound elsewhere), Kanvas logs a message and runs normally without the shortcut — it's not required for the rest of the app to work.
 
 ## Building your own package
 
