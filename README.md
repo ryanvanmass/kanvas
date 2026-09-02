@@ -44,6 +44,41 @@ Kanvas keeps its SQLite database outside the project folder, so your tasks persi
 | Linux   | `~/.local/share/kanban_board/kanban.db`    |
 | Windows | `%APPDATA%\KanbanBoard\kanban.db`          |
 
+## Building your own package
+
+There's no CI/release pipeline yet — these are manual, local build steps using [PyInstaller](https://pyinstaller.org/).
+
+```bash
+pip install pyinstaller
+```
+
+### Windows (.exe)
+
+```bash
+pyinstaller --onefile --windowed --name kanvas kanvas.py
+```
+
+The executable is written to `dist/kanvas.exe`.
+
+### Linux (.deb / .rpm)
+
+Linux packages are easiest to build with [fpm](https://github.com/jordansissel/fpm), which wraps a folder of files into a native package.
+
+```bash
+# 1. Freeze the app into a folder
+pyinstaller --onedir --windowed --name kanvas kanvas.py
+
+# 2. Install fpm (needs Ruby)
+sudo dnf install ruby ruby-devel gcc make rpm-build   # Fedora
+gem install --no-document fpm
+
+# 3. Package dist/kanvas/ as a .deb or .rpm
+fpm -s dir -t deb -n kanvas -v 1.0.0 --prefix /opt/kanvas -C dist/kanvas .
+fpm -s dir -t rpm -n kanvas -v 1.0.0 --prefix /opt/kanvas -C dist/kanvas .
+```
+
+This produces `kanvas_1.0.0_amd64.deb` and `kanvas-1.0.0.x86_64.rpm` in the current directory, installing the app to `/opt/kanvas`. Add a symlink into `/usr/local/bin` (fpm's `--after-install` hook can do this) if you want a `kanvas` command on the PATH.
+
 ## License
 
 No license has been chosen yet. All rights reserved by default until one is added.
