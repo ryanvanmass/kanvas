@@ -44,7 +44,12 @@ from PySide6.QtWidgets import (
 )
 
 APP_TITLE = "Kanvas"
-ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+# PyInstaller extracts bundled data files (see --add-data in the README's
+# build steps) next to sys._MEIPASS, not next to this script's own path -
+# __file__ inside a frozen exe points into the bootloader's internals, so
+# resolving assets/ from it would silently find nothing.
+_BASE_DIR = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+ASSETS_DIR = os.path.join(_BASE_DIR, "assets")
 WINDOWS_APP_USER_MODEL_ID = "Kanvas.KanbanBoard"
 
 # Seed columns created the first time a board is set up (whether that's
