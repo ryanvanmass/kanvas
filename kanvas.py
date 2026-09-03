@@ -37,13 +37,14 @@ from PySide6.QtCore import Qt, QRect, QDate, QObject, Signal, QPropertyAnimation
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QListWidget, QListWidgetItem, QComboBox,
+    QLabel, QPushButton, QListWidget, QListWidgetItem, QListView, QComboBox,
     QAbstractItemView, QInputDialog, QMessageBox, QDialog, QLineEdit, QTextEdit,
     QCheckBox, QDateEdit, QMenu,
 )
 
 APP_TITLE = "Kanvas"
-APP_ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "kanvas_logo.svg")
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+WINDOWS_APP_USER_MODEL_ID = "Kanvas.KanbanBoard"
 
 # Seed columns created the first time a board is set up (whether that's
 # the very first board on a fresh install, or a board created later with
@@ -996,6 +997,9 @@ class TaskListWidget(QListWidget):
         self.setDragDropMode(QAbstractItemView.DragDrop)
         self.setDefaultDropAction(Qt.MoveAction)
         self.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.setWordWrap(True)
+        self.setResizeMode(QListView.Adjust)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.itemDoubleClicked.connect(self._on_double_click)
 
     def _on_double_click(self, item):
@@ -1825,20 +1829,54 @@ def start_global_shortcut(bridge: GlobalShortcutBridge):
         return None
 
 
+def _load_app_icon() -> QIcon:
+    """Built from the PNG sizes in assets/ rather than the SVG alone: some
+    PySide6/Windows installs don't ship the SVG icon-engine plugin, which
+    leaves QIcon(svg_path) silently null and the app un-iconed everywhere
+    it's shown (title bar, taskbar, alt-tab). PNGs always work since they
+    go through the built-in image format plugins."""
+    icon = QIcon()
+    for size in (16, 32, 64, 128, 256, 512):
+        png_path = os.path.join(ASSETS_DIR, f"kanvas_logo_{size}.png")
+        if os.path.exists(png_path):
+            icon.addFile(png_path)
+    if icon.isNull():
+        svg_path = os.path.join(ASSETS_DIR, "kanvas_logo.svg")
+        if os.path.exists(svg_path):
+            icon.addFile(svg_path)
+    return icon
+
+
+def _set_windows_app_user_model_id() -> None:
+    """Without this, Windows' taskbar identifies a `python kanvas.py`
+    process by python.exe's own AppUserModelID, so it shows (and groups
+    windows under) Python's icon instead of the one set via
+    setWindowIcon()."""
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(WINDOWS_APP_USER_MODEL_ID)
+    except Exception:
+        pass
+
+
 def main():
+    if platform.system() == "Windows":
+        _set_windows_app_user_model_id()
+
     db_path = get_db_path()
     conn = get_connection(db_path)
     init_db(conn)
 
     app = QApplication(sys.argv)
     app.setStyleSheet(APP_STYLESHEET)
-    if os.path.exists(APP_ICON_PATH):
-        app.setWindowIcon(QIcon(APP_ICON_PATH))
+    app_icon = _load_app_icon()
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
 
     window = QMainWindow()
     window.setWindowTitle(APP_TITLE)
-    if os.path.exists(APP_ICON_PATH):
-        window.setWindowIcon(QIcon(APP_ICON_PATH))
+    if not app_icon.isNull():
+        window.setWindowIcon(app_icon)
     board = KanbanBoard(conn)
     window.setCentralWidget(board)
     window.resize(1150, 640)
