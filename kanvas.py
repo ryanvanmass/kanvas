@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QListWidget, QListWidgetItem, QListView, QComboBox,
     QAbstractItemView, QInputDialog, QMessageBox, QDialog, QLineEdit, QTextEdit,
     QCheckBox, QDateEdit, QSpinBox, QMenu, QToolButton, QStackedWidget,
-    QDateTimeEdit, QTimeEdit, QRadioButton, QButtonGroup,
+    QDateTimeEdit, QTimeEdit, QRadioButton, QButtonGroup, QSystemTrayIcon,
 )
 
 APP_TITLE = "Kanvas"
@@ -3510,9 +3510,13 @@ class KanbanBoard(QWidget):
     # -- global quick-add shortcut (Ctrl+Space) ---------------------------
 
     def show_quick_add_dialog(self) -> None:
-        """Slot for GlobalShortcutBridge.triggered. May be invoked while
-        the window is minimized or unfocused, so it brings the window to
-        the front itself rather than assuming it's already visible."""
+        """Slot for GlobalShortcutBridge.triggered and the tray menu's
+        Quick Add action. Deliberately independent of the main board
+        window's visibility or position - the popup shows on its own,
+        wherever the cursor currently is, whether the board is open,
+        minimized, or hidden in the system tray. This sidesteps the
+        window-restore-to-wrong-display issue entirely (#9) rather than
+        chasing it: there's no window to un-minimize/reposition here."""
         if self._quick_add_dialog is not None:
             self._quick_add_dialog.raise_()
             self._quick_add_dialog.activateWindow()
@@ -3522,33 +3526,11 @@ class KanbanBoard(QWidget):
         if not boards:
             return
 
-        top = self.window()
-        # Only touch geometry/show() when the window actually needs un-
-        # hiding/un-minimizing - calling show() unconditionally on an
-        # already-visible window was itself enough to make Windows move
-        # it (see issue #9, first half). The remaining half: restoring a
-        # minimized window, Windows puts it back on whatever display it
-        # was minimized on rather than wherever the user currently is -
-        # so move it onto the display under the cursor first.
-        if not top.isVisible() or top.isMinimized():
-            screen = QApplication.screenAt(QCursor.pos())
-            if screen is not None:
-                target_geo = screen.availableGeometry()
-                size = top.size()
-                x = target_geo.x() + (target_geo.width() - size.width()) // 2
-                y = target_geo.y() + (target_geo.height() - size.height()) // 2
-                # Clamp in case the window is larger than the target screen
-                # (e.g. a big window landing on a small/low-res monitor) -
-                # otherwise centering alone can push it partly off-screen.
-                x = max(target_geo.x(), min(x, target_geo.x() + target_geo.width() - size.width()))
-                y = max(target_geo.y(), min(y, target_geo.y() + target_geo.height() - size.height()))
-                top.move(x, y)
-            top.show()
-        top.raise_()
-        top.activateWindow()
-
         dialog = QuickAddDialog(self.conn, boards, self.current_board_id, self)
         self._quick_add_dialog = dialog
+        _move_to_cursor_screen(dialog)
+        dialog.raise_()
+        dialog.activateWindow()
         dialog.exec()
         self._quick_add_dialog = None
 
@@ -3752,6 +3734,53 @@ def _set_windows_app_user_model_id() -> None:
         pass
 
 
+def _move_to_cursor_screen(widget) -> None:
+    """Centers `widget` (clamped to fit) on whichever screen currently
+    has the mouse cursor, rather than trusting the OS to restore it
+    somewhere sensible on its own - see issue #9."""
+    screen = QApplication.screenAt(QCursor.pos())
+    if screen is None:
+        return
+    target_geo = screen.availableGeometry()
+    size = widget.size()
+    x = target_geo.x() + (target_geo.width() - size.width()) // 2
+    y = target_geo.y() + (target_geo.height() - size.height()) // 2
+    # Clamp in case the widget is larger than the target screen (e.g. a
+    # big window landing on a small/low-res monitor) - otherwise
+    # centering alone can push it partly off-screen.
+    x = max(target_geo.x(), min(x, target_geo.x() + target_geo.width() - size.width()))
+    y = max(target_geo.y(), min(y, target_geo.y() + target_geo.height() - size.height()))
+    widget.move(x, y)
+
+
+class MainWindow(QMainWindow):
+    """The board window. Closing it (the X button) hides it to the
+    system tray instead of quitting, so Kanvas keeps running in the
+    background for the global quick-add hotkey - only the tray menu's
+    Quit actually exits."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._quitting = False
+
+    def closeEvent(self, event) -> None:
+        if self._quitting or not QSystemTrayIcon.isSystemTrayAvailable():
+            event.accept()
+        else:
+            event.ignore()
+            self.hide()
+
+    def quit_app(self) -> None:
+        self._quitting = True
+        QApplication.instance().quit()
+
+    def show_and_raise(self) -> None:
+        _move_to_cursor_screen(self)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+
 def main():
     if platform.system() == "Windows":
         _set_windows_app_user_model_id()
@@ -3766,7 +3795,7 @@ def main():
     if not app_icon.isNull():
         app.setWindowIcon(app_icon)
 
-    window = QMainWindow()
+    window = MainWindow()
     window.setWindowTitle(APP_TITLE)
     if not app_icon.isNull():
         window.setWindowIcon(app_icon)
@@ -3778,6 +3807,32 @@ def main():
     board.shortcut_bridge = GlobalShortcutBridge()
     board.shortcut_bridge.triggered.connect(board.show_quick_add_dialog)
     board.shortcut_thread = start_global_shortcut(board.shortcut_bridge)
+
+    tray_icon = None
+    if QSystemTrayIcon.isSystemTrayAvailable():
+        tray_icon = QSystemTrayIcon(app_icon if not app_icon.isNull() else QIcon(), app)
+        tray_icon.setToolTip(APP_TITLE)
+
+        tray_menu = QMenu()
+        open_action = tray_menu.addAction("Open Kanvas")
+        open_action.triggered.connect(window.show_and_raise)
+        quick_add_action = tray_menu.addAction("Quick Add Task")
+        quick_add_action.triggered.connect(board.show_quick_add_dialog)
+        tray_menu.addSeparator()
+        quit_action = tray_menu.addAction("Quit Kanvas")
+        quit_action.triggered.connect(window.quit_app)
+        tray_icon.setContextMenu(tray_menu)
+
+        def _on_tray_activated(reason):
+            if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+                window.show_and_raise()
+        tray_icon.activated.connect(_on_tray_activated)
+
+        tray_icon.show()
+        # Only skip quit-on-close when there's actually a tray icon to
+        # fall back to - otherwise closing the window would leave the
+        # process running with no visible UI and no way to quit it.
+        app.setQuitOnLastWindowClosed(False)
 
     exit_code = app.exec()
     conn.close()
