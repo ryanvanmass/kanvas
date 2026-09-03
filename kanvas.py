@@ -3518,7 +3518,12 @@ class KanbanBoard(QWidget):
             return
 
         top = self.window()
-        top.show()
+        # Only call show() when the window actually needs un-hiding/un-
+        # minimizing - calling it unconditionally on an already-visible
+        # window is what was causing Windows to snap it back to the
+        # primary display on every hotkey press (see issue #9).
+        if not top.isVisible() or top.isMinimized():
+            top.show()
         top.raise_()
         top.activateWindow()
 
