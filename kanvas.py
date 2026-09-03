@@ -1427,10 +1427,20 @@ class TaskListWidget(QListWidget):
         self.setResizeMode(QListView.Adjust)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.itemDoubleClicked.connect(self._on_double_click)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._on_context_menu)
 
     def _on_double_click(self, item):
         task_id = item.data(Qt.UserRole)
         self.board.edit_task(task_id)
+
+    def _on_context_menu(self, pos) -> None:
+        item = self.itemAt(pos)
+        if item is None:
+            return
+        self.setCurrentItem(item)
+        task_id = item.data(Qt.UserRole)
+        self.board.show_move_task_menu(task_id, self.status, self.mapToGlobal(pos))
 
     def dragEnterEvent(self, event):
         source = event.source()
@@ -1993,6 +2003,18 @@ class KanbanBoard(QWidget):
             return
         move_task(self.conn, task_id, new_status)
         self.refresh()
+
+    def show_move_task_menu(self, task_id: str, current_status: str, global_pos) -> None:
+        menu = QMenu(self)
+        other_columns = [col for col in self._columns_cache if col["status"] != current_status]
+        if not other_columns:
+            no_columns_action = menu.addAction("No other columns")
+            no_columns_action.setEnabled(False)
+        else:
+            for col in other_columns:
+                action = menu.addAction(f"Move to {col['name']}")
+                action.triggered.connect(lambda checked=False, s=col["status"]: self.handle_move(task_id, s))
+        menu.exec(global_pos)
 
     def delete_task_ui(self, task_id: str) -> None:
         task = get_task(self.conn, task_id)
