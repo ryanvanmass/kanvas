@@ -31,15 +31,15 @@ import secrets
 import sqlite3
 import platform
 import threading
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 from PySide6.QtCore import Qt, QRect, QDate, QObject, Signal, QPropertyAnimation, QEasingCurve
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QAction
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QListView, QComboBox,
     QAbstractItemView, QInputDialog, QMessageBox, QDialog, QLineEdit, QTextEdit,
-    QCheckBox, QDateEdit, QMenu,
+    QCheckBox, QDateEdit, QSpinBox, QMenu, QToolButton,
 )
 
 APP_TITLE = "Kanvas"
@@ -241,6 +241,26 @@ def init_db(conn: sqlite3.Connection) -> None:
             position INTEGER NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS task_templates (
+            id TEXT PRIMARY KEY,
+            board_id TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            notes TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL,
+            due_offset_days INTEGER,
+            joplin_link TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS template_subtasks (
+            id TEXT PRIMARY KEY,
+            template_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            position INTEGER NOT NULL
+        )
+    """)
     conn.commit()
 
     _migrate_legacy_single_board_schema(conn)
@@ -320,6 +340,12 @@ def delete_board(conn: sqlite3.Connection, board_id: str) -> None:
 
     conn.execute("DELETE FROM tasks WHERE board_id = ?", (board_id,))
     conn.execute("DELETE FROM columns WHERE board_id = ?", (board_id,))
+    conn.execute(
+        "DELETE FROM template_subtasks WHERE template_id IN "
+        "(SELECT id FROM task_templates WHERE board_id = ?)",
+        (board_id,),
+    )
+    conn.execute("DELETE FROM task_templates WHERE board_id = ?", (board_id,))
     conn.execute("DELETE FROM boards WHERE id = ?", (board_id,))
     conn.commit()
     _compact_board_positions(conn)
@@ -550,6 +576,124 @@ def delete_subtask(conn: sqlite3.Connection, subtask_id: str) -> None:
     conn.commit()
 
 
+# -- Task templates (per-board presets that prefill the New Task dialog) ----
+
+def get_templates(conn: sqlite3.Connection, board_id: str) -> list:
+    rows = conn.execute(
+        "SELECT * FROM task_templates WHERE board_id = ? ORDER BY position ASC", (board_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_template(conn: sqlite3.Connection, template_id: str):
+    row = conn.execute("SELECT * FROM task_templates WHERE id = ?", (template_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def get_template_subtasks(conn: sqlite3.Connection, template_id: str) -> list:
+    rows = conn.execute(
+        "SELECT * FROM template_subtasks WHERE template_id = ? ORDER BY position ASC", (template_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _replace_template_subtasks(conn: sqlite3.Connection, template_id: str, subtask_titles: list) -> None:
+    conn.execute("DELETE FROM template_subtasks WHERE template_id = ?", (template_id,))
+    for position, title in enumerate(subtask_titles):
+        conn.execute(
+            "INSERT INTO template_subtasks (id, template_id, title, position) VALUES (?, ?, ?, ?)",
+            (uuid.uuid4().hex, template_id, title, position),
+        )
+
+
+def add_template(
+    conn: sqlite3.Connection,
+    board_id: str,
+    title: str,
+    notes: str,
+    status: str,
+    due_offset_days,
+    joplin_link: str,
+    subtask_titles: list,
+) -> dict:
+    title = title.strip()
+    if not title:
+        raise ValueError("Template title cannot be empty.")
+
+    max_position_row = conn.execute(
+        "SELECT MAX(position) AS m FROM task_templates WHERE board_id = ?", (board_id,)
+    ).fetchone()
+    next_position = (max_position_row["m"] + 1) if max_position_row["m"] is not None else 0
+
+    template_id = uuid.uuid4().hex
+    conn.execute(
+        "INSERT INTO task_templates "
+        "(id, board_id, position, title, notes, status, due_offset_days, joplin_link) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (template_id, board_id, next_position, title, notes, status, due_offset_days, joplin_link),
+    )
+    _replace_template_subtasks(conn, template_id, subtask_titles)
+    conn.commit()
+    return get_template(conn, template_id)
+
+
+def update_template(
+    conn: sqlite3.Connection,
+    template_id: str,
+    title: str,
+    notes: str,
+    status: str,
+    due_offset_days,
+    joplin_link: str,
+    subtask_titles: list,
+) -> None:
+    title = title.strip()
+    if not title:
+        raise ValueError("Template title cannot be empty.")
+
+    conn.execute(
+        "UPDATE task_templates SET title = ?, notes = ?, status = ?, due_offset_days = ?, joplin_link = ? "
+        "WHERE id = ?",
+        (title, notes, status, due_offset_days, joplin_link, template_id),
+    )
+    _replace_template_subtasks(conn, template_id, subtask_titles)
+    conn.commit()
+
+
+def _compact_template_positions(conn: sqlite3.Connection, board_id: str) -> None:
+    for position, tpl in enumerate(get_templates(conn, board_id)):
+        if tpl["position"] != position:
+            conn.execute("UPDATE task_templates SET position = ? WHERE id = ?", (position, tpl["id"]))
+    conn.commit()
+
+
+def delete_template(conn: sqlite3.Connection, template_id: str) -> None:
+    template = get_template(conn, template_id)
+    if template is None:
+        return
+    conn.execute("DELETE FROM template_subtasks WHERE template_id = ?", (template_id,))
+    conn.execute("DELETE FROM task_templates WHERE id = ?", (template_id,))
+    conn.commit()
+    _compact_template_positions(conn, template["board_id"])
+
+
+def move_template(conn: sqlite3.Connection, board_id: str, template_id: str, direction: int) -> None:
+    templates = get_templates(conn, board_id)
+    ids = [t["id"] for t in templates]
+    if template_id not in ids:
+        return
+
+    idx = ids.index(template_id)
+    new_idx = idx + direction
+    if new_idx < 0 or new_idx >= len(templates):
+        return
+
+    templates[idx], templates[new_idx] = templates[new_idx], templates[idx]
+    for position, tpl in enumerate(templates):
+        conn.execute("UPDATE task_templates SET position = ? WHERE id = ?", (position, tpl["id"]))
+    conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
@@ -608,6 +752,33 @@ QPushButton[accent="true"]:hover {{
 
 QPushButton[compact="true"] {{
     padding: 2px 0px;
+}}
+
+QToolButton {{
+    background-color: #2c2e33;
+    color: #e8e8e8;
+    border: 1px solid #3a3d42;
+    border-radius: 6px;
+    padding: 5px 28px 5px 10px;
+}}
+QToolButton:hover {{
+    background-color: #34363b;
+}}
+QToolButton:pressed {{
+    background-color: #26282c;
+}}
+QToolButton[accent="true"] {{
+    background-color: {ACCENT_COLOR};
+    border: 1px solid {ACCENT_COLOR};
+    color: #ffffff;
+    font-weight: bold;
+}}
+QToolButton[accent="true"]:hover {{
+    background-color: {ACCENT_COLOR_HOVER};
+}}
+QToolButton::menu-button {{
+    border: none;
+    width: 22px;
 }}
 
 TaskListWidget {{
@@ -799,23 +970,25 @@ class NewTaskDialog(QDialog):
     TaskCardDialog's edit form (title/status/due date/Joplin link/notes)
     instead of the sequence of plain input-box prompts this replaced."""
 
-    def __init__(self, columns: list, default_status: str, parent=None):
+    def __init__(self, columns: list, default_status: str, parent=None, prefill: dict = None):
         super().__init__(parent)
         self.setWindowTitle("New Task")
         self.resize(420, 420)
+        prefill = prefill or {}
 
         layout = QVBoxLayout(self)
 
         layout.addWidget(QLabel("Title"))
-        self.title_edit = QLineEdit()
+        self.title_edit = QLineEdit(prefill.get("title", ""))
         layout.addWidget(self.title_edit)
 
         layout.addWidget(QLabel("Status"))
         self.status_combo = QComboBox()
         for col in columns:
             self.status_combo.addItem(col["name"], col["status"])
+        target_status = prefill.get("status") or default_status
         default_idx = next(
-            (i for i, col in enumerate(columns) if col["status"] == default_status), 0
+            (i for i, col in enumerate(columns) if col["status"] == target_status), 0
         )
         self.status_combo.setCurrentIndex(default_idx)
         layout.addWidget(self.status_combo)
@@ -827,19 +1000,22 @@ class NewTaskDialog(QDialog):
         self.due_date_edit = QDateEdit()
         self.due_date_edit.setCalendarPopup(True)
         self.due_date_edit.setDisplayFormat("yyyy-MM-dd")
-        self.due_date_edit.setDate(QDate.currentDate())
-        self.due_date_edit.setEnabled(False)
+        prefill_due_date = QDate.fromString(prefill.get("due_date") or "", "yyyy-MM-dd")
+        self.due_date_check.setChecked(prefill_due_date.isValid())
+        self.due_date_edit.setDate(prefill_due_date if prefill_due_date.isValid() else QDate.currentDate())
+        self.due_date_edit.setEnabled(prefill_due_date.isValid())
         self.due_date_check.toggled.connect(self.due_date_edit.setEnabled)
         due_row.addWidget(self.due_date_edit, stretch=1)
         layout.addLayout(due_row)
 
         layout.addWidget(QLabel("Joplin Note Link"))
-        self.joplin_link_edit = QLineEdit()
+        self.joplin_link_edit = QLineEdit(prefill.get("joplin_link", ""))
         self.joplin_link_edit.setPlaceholderText("joplin://... or https://...")
         layout.addWidget(self.joplin_link_edit)
 
         layout.addWidget(QLabel("Notes"))
         self.notes_edit = QTextEdit()
+        self.notes_edit.setPlainText(prefill.get("notes", ""))
         layout.addWidget(self.notes_edit, stretch=1)
 
         btn_row = QHBoxLayout()
@@ -865,6 +1041,256 @@ class NewTaskDialog(QDialog):
             "due_date": due_date,
             "joplin_link": self.joplin_link_edit.text().strip(),
         }
+
+
+class TemplateEditorDialog(QDialog):
+    """Create/edit form for a single task template. Unlike TaskCardDialog,
+    the subtask checklist here is staged in memory (self._subtask_titles)
+    and only written to the database when the whole template is saved -
+    a template is a definition object, not a live task, so there's no
+    "already in progress" checklist state that would make a Cancel feel
+    surprising."""
+
+    def __init__(self, columns: list, template: dict = None, subtask_titles: list = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Template" if template else "New Template")
+        self.resize(420, 520)
+        self._subtask_titles = list(subtask_titles or [])
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("Title"))
+        self.title_edit = QLineEdit(template["title"] if template else "")
+        layout.addWidget(self.title_edit)
+
+        layout.addWidget(QLabel("Column"))
+        self.status_combo = QComboBox()
+        for col in columns:
+            self.status_combo.addItem(col["name"], col["status"])
+        target_status = template["status"] if template else None
+        default_idx = next(
+            (i for i, col in enumerate(columns) if col["status"] == target_status), 0
+        )
+        self.status_combo.setCurrentIndex(default_idx)
+        layout.addWidget(self.status_combo)
+
+        layout.addWidget(QLabel("Due Date"))
+        due_row = QHBoxLayout()
+        existing_offset = template.get("due_offset_days") if template else None
+        self.due_date_check = QCheckBox("Set")
+        self.due_date_check.setChecked(existing_offset is not None)
+        due_row.addWidget(self.due_date_check)
+        self.due_offset_spin = QSpinBox()
+        self.due_offset_spin.setRange(0, 3650)
+        self.due_offset_spin.setSuffix(" day(s) from creation")
+        self.due_offset_spin.setValue(existing_offset if existing_offset is not None else 0)
+        self.due_offset_spin.setEnabled(existing_offset is not None)
+        self.due_date_check.toggled.connect(self.due_offset_spin.setEnabled)
+        due_row.addWidget(self.due_offset_spin, stretch=1)
+        layout.addLayout(due_row)
+
+        layout.addWidget(QLabel("Joplin Note Link"))
+        self.joplin_link_edit = QLineEdit(template.get("joplin_link", "") if template else "")
+        self.joplin_link_edit.setPlaceholderText("joplin://... or https://...")
+        layout.addWidget(self.joplin_link_edit)
+
+        layout.addWidget(QLabel("Notes"))
+        self.notes_edit = QTextEdit()
+        self.notes_edit.setPlainText(template.get("notes", "") if template else "")
+        layout.addWidget(self.notes_edit, stretch=1)
+
+        layout.addWidget(QLabel("Subtasks"))
+        self.subtasks_list = QListWidget()
+        layout.addWidget(self.subtasks_list, stretch=1)
+        self._refresh_subtasks_list()
+
+        subtask_add_row = QHBoxLayout()
+        self.new_subtask_edit = QLineEdit()
+        self.new_subtask_edit.setPlaceholderText("New subtask...")
+        self.new_subtask_edit.returnPressed.connect(self._add_subtask)
+        subtask_add_row.addWidget(self.new_subtask_edit)
+        add_subtask_btn = QPushButton("Add")
+        add_subtask_btn.clicked.connect(self._add_subtask)
+        subtask_add_row.addWidget(add_subtask_btn)
+        delete_subtask_btn = QPushButton("Delete")
+        delete_subtask_btn.clicked.connect(self._delete_selected_subtask)
+        subtask_add_row.addWidget(delete_subtask_btn)
+        layout.addLayout(subtask_add_row)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        save_btn = QPushButton("Save")
+        save_btn.setProperty("accent", True)
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self.accept)
+        btn_row.addWidget(save_btn)
+        layout.addLayout(btn_row)
+
+        self.title_edit.setFocus()
+
+    def _refresh_subtasks_list(self) -> None:
+        self.subtasks_list.clear()
+        for title in self._subtask_titles:
+            self.subtasks_list.addItem(QListWidgetItem(title))
+
+    def _add_subtask(self) -> None:
+        title = self.new_subtask_edit.text().strip()
+        if not title:
+            return
+        self._subtask_titles.append(title)
+        self.new_subtask_edit.clear()
+        self._refresh_subtasks_list()
+
+    def _delete_selected_subtask(self) -> None:
+        row = self.subtasks_list.currentRow()
+        if row < 0:
+            return
+        del self._subtask_titles[row]
+        self._refresh_subtasks_list()
+
+    def result_values(self) -> dict:
+        due_offset_days = self.due_offset_spin.value() if self.due_date_check.isChecked() else None
+        return {
+            "title": self.title_edit.text().strip(),
+            "notes": self.notes_edit.toPlainText().strip(),
+            "status": self.status_combo.currentData(),
+            "due_offset_days": due_offset_days,
+            "joplin_link": self.joplin_link_edit.text().strip(),
+            "subtask_titles": list(self._subtask_titles),
+        }
+
+
+class ManageTemplatesDialog(QDialog):
+    """Lists a board's task templates with add/edit/delete/reorder
+    controls, mirroring the board-management pattern (rename/delete via
+    dialogs, immediate writes rather than a staged save)."""
+
+    def __init__(self, conn: sqlite3.Connection, board_id: str, columns: list, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.board_id = board_id
+        self.columns = columns
+        self.setWindowTitle("Manage Templates")
+        self.resize(380, 420)
+
+        layout = QVBoxLayout(self)
+
+        self.templates_list = QListWidget()
+        self.templates_list.itemDoubleClicked.connect(lambda _item: self._edit_selected())
+        layout.addWidget(self.templates_list, stretch=1)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("+ Add")
+        add_btn.clicked.connect(self._add_template)
+        btn_row.addWidget(add_btn)
+        edit_btn = QPushButton("Edit")
+        edit_btn.clicked.connect(self._edit_selected)
+        btn_row.addWidget(edit_btn)
+        up_btn = QPushButton("Up")
+        up_btn.clicked.connect(lambda: self._move_selected(-1))
+        btn_row.addWidget(up_btn)
+        down_btn = QPushButton("Down")
+        down_btn.clicked.connect(lambda: self._move_selected(1))
+        btn_row.addWidget(down_btn)
+        delete_btn = QPushButton("Delete")
+        delete_btn.setStyleSheet("color: #b00000;")
+        delete_btn.clicked.connect(self._delete_selected)
+        btn_row.addWidget(delete_btn)
+        layout.addLayout(btn_row)
+
+        close_row = QHBoxLayout()
+        close_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setDefault(True)
+        close_btn.clicked.connect(self.accept)
+        close_row.addWidget(close_btn)
+        layout.addLayout(close_row)
+
+        self.refresh()
+
+    def refresh(self) -> None:
+        self.templates_list.clear()
+        for tpl in get_templates(self.conn, self.board_id):
+            item = QListWidgetItem(tpl["title"])
+            item.setData(Qt.UserRole, tpl["id"])
+            self.templates_list.addItem(item)
+
+    def _selected_template_id(self):
+        item = self.templates_list.currentItem()
+        return item.data(Qt.UserRole) if item is not None else None
+
+    def _add_template(self) -> None:
+        dialog = TemplateEditorDialog(self.columns, parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        values = dialog.result_values()
+        if not values["title"]:
+            QMessageBox.warning(self, "Title required", "Template title cannot be empty.")
+            return
+        try:
+            add_template(
+                self.conn, self.board_id, values["title"], values["notes"], values["status"],
+                values["due_offset_days"], values["joplin_link"], values["subtask_titles"],
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "Could not add template", str(e))
+            return
+        self.refresh()
+
+    def _edit_selected(self) -> None:
+        template_id = self._selected_template_id()
+        if template_id is None:
+            return
+        template = get_template(self.conn, template_id)
+        if template is None:
+            return
+        subtask_titles = [s["title"] for s in get_template_subtasks(self.conn, template_id)]
+        dialog = TemplateEditorDialog(self.columns, template=template, subtask_titles=subtask_titles, parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        values = dialog.result_values()
+        if not values["title"]:
+            QMessageBox.warning(self, "Title required", "Template title cannot be empty.")
+            return
+        try:
+            update_template(
+                self.conn, template_id, values["title"], values["notes"], values["status"],
+                values["due_offset_days"], values["joplin_link"], values["subtask_titles"],
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "Could not update template", str(e))
+            return
+        self.refresh()
+
+    def _delete_selected(self) -> None:
+        template_id = self._selected_template_id()
+        if template_id is None:
+            return
+        template = get_template(self.conn, template_id)
+        if template is None:
+            return
+        reply = QMessageBox.question(
+            self, "Delete template", f'Delete the "{template["title"]}" template?',
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        delete_template(self.conn, template_id)
+        self.refresh()
+
+    def _move_selected(self, direction: int) -> None:
+        template_id = self._selected_template_id()
+        if template_id is None:
+            return
+        move_template(self.conn, self.board_id, template_id, direction)
+        self.refresh()
+        for i in range(self.templates_list.count()):
+            if self.templates_list.item(i).data(Qt.UserRole) == template_id:
+                self.templates_list.setCurrentRow(i)
+                break
 
 
 class QuickAddDialog(QDialog):
@@ -1263,10 +1689,15 @@ class KanbanBoard(QWidget):
         self.board_menu_btn.clicked.connect(self.toggle_board_panel)
         toolbar.addWidget(self.board_menu_btn)
 
-        add_task_btn = QPushButton("+ New Task")
-        add_task_btn.setProperty("accent", True)
-        add_task_btn.clicked.connect(self.add_task)
-        toolbar.addWidget(add_task_btn)
+        self.add_task_btn = QToolButton()
+        self.add_task_btn.setText("+ New Task")
+        self.add_task_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.add_task_btn.setProperty("accent", True)
+        self.add_task_btn.setPopupMode(QToolButton.MenuButtonPopup)
+        self.add_task_btn.clicked.connect(lambda: self.add_task())
+        self.new_task_menu = QMenu(self.add_task_btn)
+        self.add_task_btn.setMenu(self.new_task_menu)
+        toolbar.addWidget(self.add_task_btn)
 
         toolbar.addStretch()
 
@@ -1417,6 +1848,7 @@ class KanbanBoard(QWidget):
             self.columns[col["status"]] = widget
             self.columns_layout.addWidget(widget)
 
+        self._rebuild_new_task_menu()
         self.refresh()
 
     def _on_edit_board_toggled(self, checked: bool) -> None:
@@ -1465,13 +1897,29 @@ class KanbanBoard(QWidget):
 
     # -- task operations ------------------------------------------------
 
-    def add_task(self) -> None:
+    def add_task(self, template: dict = None) -> None:
         if not self._columns_cache:
             QMessageBox.information(self, "No columns", "Add a column first.")
             return
 
         default_status = get_default_new_task_status(self.conn, self.current_board_id)
-        dialog = NewTaskDialog(self._columns_cache, default_status, self)
+
+        prefill = None
+        template_subtask_titles = []
+        if template is not None:
+            due_date = ""
+            if template.get("due_offset_days") is not None:
+                due_date = (date.today() + timedelta(days=template["due_offset_days"])).strftime("%Y-%m-%d")
+            prefill = {
+                "title": template["title"],
+                "notes": template["notes"],
+                "status": template["status"],
+                "due_date": due_date,
+                "joplin_link": template["joplin_link"],
+            }
+            template_subtask_titles = [s["title"] for s in get_template_subtasks(self.conn, template["id"])]
+
+        dialog = NewTaskDialog(self._columns_cache, default_status, self, prefill=prefill)
         if dialog.exec() != QDialog.Accepted:
             return
 
@@ -1486,7 +1934,31 @@ class KanbanBoard(QWidget):
                 self.conn, task["id"], values["title"], values["notes"],
                 values["due_date"], values["joplin_link"],
             )
+        for subtask_title in template_subtask_titles:
+            add_subtask(self.conn, task["id"], subtask_title)
         self.refresh()
+
+    # -- templates (per-board presets that prefill the New Task dialog) --
+
+    def _rebuild_new_task_menu(self) -> None:
+        self.new_task_menu.clear()
+        templates = get_templates(self.conn, self.current_board_id) if self.current_board_id else []
+        if not templates:
+            empty_action = self.new_task_menu.addAction("No templates yet")
+            empty_action.setEnabled(False)
+        else:
+            for tpl in templates:
+                action = QAction(tpl["title"], self.new_task_menu)
+                action.triggered.connect(lambda checked=False, t=tpl: self.add_task(template=t))
+                self.new_task_menu.addAction(action)
+        self.new_task_menu.addSeparator()
+        manage_action = self.new_task_menu.addAction("Manage Templates…")
+        manage_action.triggered.connect(self.manage_templates_ui)
+
+    def manage_templates_ui(self) -> None:
+        dialog = ManageTemplatesDialog(self.conn, self.current_board_id, self._columns_cache, self)
+        dialog.exec()
+        self._rebuild_new_task_menu()
 
     def edit_task(self, task_id: str) -> None:
         task = get_task(self.conn, task_id)
