@@ -1495,6 +1495,13 @@ class ColumnWidget(QWidget):
         header_row.addWidget(self.header_label)
         header_row.addStretch()
 
+        add_task_btn = QPushButton("+")
+        add_task_btn.setFixedWidth(26)
+        add_task_btn.setProperty("compact", True)
+        add_task_btn.setToolTip("Add a task to this column")
+        add_task_btn.clicked.connect(lambda: self.board.add_task(target_status=self.status))
+        header_row.addWidget(add_task_btn)
+
         left_btn = QPushButton("<")
         left_btn.setFixedWidth(26)
         left_btn.setProperty("compact", True)
@@ -1907,12 +1914,12 @@ class KanbanBoard(QWidget):
 
     # -- task operations ------------------------------------------------
 
-    def add_task(self, template: dict = None) -> None:
+    def add_task(self, template: dict = None, target_status: str = None) -> None:
         if not self._columns_cache:
             QMessageBox.information(self, "No columns", "Add a column first.")
             return
 
-        default_status = get_default_new_task_status(self.conn, self.current_board_id)
+        default_status = target_status or get_default_new_task_status(self.conn, self.current_board_id)
 
         prefill = None
         template_subtask_titles = []
