@@ -34,7 +34,7 @@ import threading
 from datetime import datetime, date, timedelta, time as dt_time
 
 from PySide6.QtCore import Qt, QRect, QDate, QTime, QDateTime, QTimer, QObject, Signal, QPropertyAnimation, QEasingCurve
-from PySide6.QtGui import QIcon, QAction, QFont, QColor
+from PySide6.QtGui import QIcon, QAction, QFont, QColor, QCursor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QListView, QComboBox,
@@ -3523,11 +3523,26 @@ class KanbanBoard(QWidget):
             return
 
         top = self.window()
-        # Only call show() when the window actually needs un-hiding/un-
-        # minimizing - calling it unconditionally on an already-visible
-        # window is what was causing Windows to snap it back to the
-        # primary display on every hotkey press (see issue #9).
+        # Only touch geometry/show() when the window actually needs un-
+        # hiding/un-minimizing - calling show() unconditionally on an
+        # already-visible window was itself enough to make Windows move
+        # it (see issue #9, first half). The remaining half: restoring a
+        # minimized window, Windows puts it back on whatever display it
+        # was minimized on rather than wherever the user currently is -
+        # so move it onto the display under the cursor first.
         if not top.isVisible() or top.isMinimized():
+            screen = QApplication.screenAt(QCursor.pos())
+            if screen is not None:
+                target_geo = screen.availableGeometry()
+                size = top.size()
+                x = target_geo.x() + (target_geo.width() - size.width()) // 2
+                y = target_geo.y() + (target_geo.height() - size.height()) // 2
+                # Clamp in case the window is larger than the target screen
+                # (e.g. a big window landing on a small/low-res monitor) -
+                # otherwise centering alone can push it partly off-screen.
+                x = max(target_geo.x(), min(x, target_geo.x() + target_geo.width() - size.width()))
+                y = max(target_geo.y(), min(y, target_geo.y() + target_geo.height() - size.height()))
+                top.move(x, y)
             top.show()
         top.raise_()
         top.activateWindow()
