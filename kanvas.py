@@ -31,15 +31,16 @@ import secrets
 import sqlite3
 import platform
 import threading
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time as dt_time
 
-from PySide6.QtCore import Qt, QRect, QDate, QObject, Signal, QPropertyAnimation, QEasingCurve
-from PySide6.QtGui import QIcon, QAction
+from PySide6.QtCore import Qt, QRect, QDate, QTime, QDateTime, QTimer, QObject, Signal, QPropertyAnimation, QEasingCurve
+from PySide6.QtGui import QIcon, QAction, QFont, QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QListView, QComboBox,
     QAbstractItemView, QInputDialog, QMessageBox, QDialog, QLineEdit, QTextEdit,
-    QCheckBox, QDateEdit, QSpinBox, QMenu, QToolButton,
+    QCheckBox, QDateEdit, QSpinBox, QMenu, QToolButton, QStackedWidget,
+    QDateTimeEdit, QTimeEdit, QRadioButton, QButtonGroup,
 )
 
 APP_TITLE = "Kanvas"
@@ -145,6 +146,16 @@ def _migrate_task_card_fields(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_task_completion_fields(conn: sqlite3.Connection) -> None:
+    """Adds the completed/completed_at columns to "tasks" for databases
+    created before task completion was tracked independently of column."""
+    if not _table_has_column(conn, "tasks", "completed"):
+        conn.execute("ALTER TABLE tasks ADD COLUMN completed INTEGER NOT NULL DEFAULT 0")
+    if not _table_has_column(conn, "tasks", "completed_at"):
+        conn.execute("ALTER TABLE tasks ADD COLUMN completed_at TEXT NOT NULL DEFAULT ''")
+    conn.commit()
+
+
 def _migrate_legacy_single_board_schema(conn: sqlite3.Connection) -> None:
     """If this database was created by a pre-multi-board version of this
     app, its "columns" table has no board_id column and a single-column
@@ -229,7 +240,9 @@ def init_db(conn: sqlite3.Connection) -> None:
             created TEXT NOT NULL,
             updated TEXT NOT NULL,
             due_date TEXT NOT NULL DEFAULT '',
-            joplin_link TEXT NOT NULL DEFAULT ''
+            joplin_link TEXT NOT NULL DEFAULT '',
+            completed INTEGER NOT NULL DEFAULT 0,
+            completed_at TEXT NOT NULL DEFAULT ''
         )
     """)
     conn.execute("""
@@ -261,10 +274,46 @@ def init_db(conn: sqlite3.Connection) -> None:
             position INTEGER NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS automation_rules (
+            id TEXT PRIMARY KEY,
+            board_id TEXT NOT NULL,
+            rule_type TEXT NOT NULL,
+            name TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+
+            schedule_kind TEXT NOT NULL,
+            schedule_time TEXT NOT NULL DEFAULT '09:00',
+            schedule_weekdays TEXT NOT NULL DEFAULT '',
+            schedule_interval_days INTEGER,
+            schedule_datetime TEXT,
+            next_run TEXT,
+            last_run TEXT,
+
+            template_id TEXT,
+            task_title TEXT NOT NULL DEFAULT '',
+            task_notes TEXT NOT NULL DEFAULT '',
+            task_status TEXT,
+            task_joplin_link TEXT NOT NULL DEFAULT '',
+            task_due_offset_days INTEGER,
+
+            from_status TEXT,
+            to_status TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS automation_rule_subtasks (
+            id TEXT PRIMARY KEY,
+            rule_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            position INTEGER NOT NULL
+        )
+    """)
     conn.commit()
 
     _migrate_legacy_single_board_schema(conn)
     _migrate_task_card_fields(conn)
+    _migrate_task_completion_fields(conn)
 
     # Fresh install: no boards exist yet at all (migration only runs for
     # upgrades, so this is the true "never used before" case).
@@ -346,6 +395,12 @@ def delete_board(conn: sqlite3.Connection, board_id: str) -> None:
         (board_id,),
     )
     conn.execute("DELETE FROM task_templates WHERE board_id = ?", (board_id,))
+    conn.execute(
+        "DELETE FROM automation_rule_subtasks WHERE rule_id IN "
+        "(SELECT id FROM automation_rules WHERE board_id = ?)",
+        (board_id,),
+    )
+    conn.execute("DELETE FROM automation_rules WHERE board_id = ?", (board_id,))
     conn.execute("DELETE FROM boards WHERE id = ?", (board_id,))
     conn.commit()
     _compact_board_positions(conn)
@@ -531,6 +586,18 @@ def move_task(conn: sqlite3.Connection, task_id: str, new_status: str) -> None:
     conn.commit()
 
 
+def set_task_completed(conn: sqlite3.Connection, task_id: str, completed: bool) -> None:
+    """Completion is tracked independently of column - a completed task
+    stays wherever it is, it's just hidden from the board by default (see
+    KanbanBoard's "Show Completed" toggle)."""
+    now = _now()
+    conn.execute(
+        "UPDATE tasks SET completed = ?, completed_at = ?, updated = ? WHERE id = ?",
+        (1 if completed else 0, now if completed else "", now, task_id),
+    )
+    conn.commit()
+
+
 def delete_task(conn: sqlite3.Connection, task_id: str) -> None:
     conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
     conn.execute("DELETE FROM subtasks WHERE task_id = ?", (task_id,))
@@ -694,6 +761,418 @@ def move_template(conn: sqlite3.Connection, board_id: str, template_id: str, dir
     conn.commit()
 
 
+# -- Task automation (per-board scheduled rules) -----------------------------
+#
+# Kanvas has no background service, so a rule's `next_run` is only ever
+# checked while the app is open (a timer in KanbanBoard, plus once at
+# startup) - see run_due_automation_rules(). This means a rule "catches
+# up" at most once per missed occurrence, not once per occurrence that
+# would have fired while the app was closed.
+
+def _compute_next_run(
+    schedule_kind: str,
+    schedule_time: str,
+    schedule_weekdays: str,
+    schedule_interval_days,
+    schedule_datetime,
+    after: datetime,
+):
+    """Next ISO datetime string this schedule should fire strictly after
+    `after`, or None if there's nothing left to schedule (e.g. 'once')."""
+    if schedule_kind == "once":
+        return schedule_datetime
+
+    if schedule_kind == "hourly":
+        # Reuses schedule_interval_days as an hour count (see
+        # ScheduleEditorWidget.get_values()) rather than a schema column
+        # of its own. Always lands on the hour mark rather than N hours
+        # from whatever minute `after` happens to be.
+        interval_hours = schedule_interval_days or 1
+        candidate = after.replace(minute=0, second=0, microsecond=0) + timedelta(hours=interval_hours)
+        return candidate.isoformat(timespec="seconds")
+
+    hh, mm = (int(part) for part in schedule_time.split(":"))
+
+    if schedule_kind == "daily":
+        candidate = after.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if candidate <= after:
+            candidate += timedelta(days=1)
+        return candidate.isoformat(timespec="seconds")
+
+    if schedule_kind == "weekly":
+        weekdays = sorted(int(d) for d in schedule_weekdays.split(",") if d != "")
+        if not weekdays:
+            return None
+        for offset in range(8):
+            candidate_date = (after + timedelta(days=offset)).date()
+            if candidate_date.weekday() in weekdays:
+                candidate = datetime.combine(candidate_date, dt_time(hh, mm))
+                if candidate > after:
+                    return candidate.isoformat(timespec="seconds")
+        return None
+
+    if schedule_kind == "interval":
+        interval_days = schedule_interval_days or 1
+        candidate = after.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if candidate <= after:
+            candidate += timedelta(days=interval_days)
+        return candidate.isoformat(timespec="seconds")
+
+    return None
+
+
+def get_automation_rules(conn: sqlite3.Connection, board_id: str) -> list:
+    rows = conn.execute(
+        "SELECT * FROM automation_rules WHERE board_id = ? ORDER BY name ASC", (board_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_automation_rule(conn: sqlite3.Connection, rule_id: str):
+    row = conn.execute("SELECT * FROM automation_rules WHERE id = ?", (rule_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def get_automation_rule_subtasks(conn: sqlite3.Connection, rule_id: str) -> list:
+    rows = conn.execute(
+        "SELECT * FROM automation_rule_subtasks WHERE rule_id = ? ORDER BY position ASC", (rule_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _replace_automation_rule_subtasks(conn: sqlite3.Connection, rule_id: str, subtask_titles: list) -> None:
+    conn.execute("DELETE FROM automation_rule_subtasks WHERE rule_id = ?", (rule_id,))
+    for position, title in enumerate(subtask_titles):
+        conn.execute(
+            "INSERT INTO automation_rule_subtasks (id, rule_id, title, position) VALUES (?, ?, ?, ?)",
+            (uuid.uuid4().hex, rule_id, title, position),
+        )
+
+
+def _insert_automation_rule(
+    conn: sqlite3.Connection, rule_id: str, board_id: str, rule_type: str, name: str, enabled: bool,
+    schedule_kind: str, schedule_time: str, schedule_weekdays: str, schedule_interval_days, schedule_datetime,
+    next_run, template_id=None, task_title="", task_notes="", task_status=None, task_joplin_link="",
+    task_due_offset_days=None, from_status=None, to_status=None,
+) -> None:
+    conn.execute(
+        "INSERT INTO automation_rules "
+        "(id, board_id, rule_type, name, enabled, schedule_kind, schedule_time, schedule_weekdays, "
+        "schedule_interval_days, schedule_datetime, next_run, last_run, "
+        "template_id, task_title, task_notes, task_status, task_joplin_link, task_due_offset_days, "
+        "from_status, to_status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (rule_id, board_id, rule_type, name, 1 if enabled else 0, schedule_kind, schedule_time,
+         schedule_weekdays, schedule_interval_days, schedule_datetime, next_run,
+         template_id, task_title, task_notes, task_status, task_joplin_link, task_due_offset_days,
+         from_status, to_status),
+    )
+
+
+def add_create_task_rule(
+    conn: sqlite3.Connection, board_id: str, name: str, enabled: bool,
+    schedule_kind: str, schedule_time: str, schedule_weekdays: str, schedule_interval_days, schedule_datetime,
+    template_id, task_title: str, task_notes: str, task_status, task_joplin_link: str, task_due_offset_days,
+    subtask_titles: list,
+) -> dict:
+    name = name.strip()
+    if not name:
+        raise ValueError("Rule name cannot be empty.")
+
+    rule_id = uuid.uuid4().hex
+    next_run = _compute_next_run(
+        schedule_kind, schedule_time, schedule_weekdays, schedule_interval_days, schedule_datetime,
+        after=datetime.now(),
+    )
+    _insert_automation_rule(
+        conn, rule_id, board_id, "create_task", name, enabled,
+        schedule_kind, schedule_time, schedule_weekdays, schedule_interval_days, schedule_datetime, next_run,
+        template_id=template_id, task_title=task_title, task_notes=task_notes, task_status=task_status,
+        task_joplin_link=task_joplin_link, task_due_offset_days=task_due_offset_days,
+    )
+    _replace_automation_rule_subtasks(conn, rule_id, subtask_titles)
+    conn.commit()
+    return get_automation_rule(conn, rule_id)
+
+
+def add_move_task_rule(
+    conn: sqlite3.Connection, board_id: str, name: str, enabled: bool,
+    schedule_kind: str, schedule_time: str, schedule_weekdays: str, schedule_interval_days, schedule_datetime,
+    from_status: str, to_status: str,
+) -> dict:
+    name = name.strip()
+    if not name:
+        raise ValueError("Rule name cannot be empty.")
+    if from_status == to_status:
+        raise ValueError("The \"from\" and \"to\" columns must be different.")
+
+    rule_id = uuid.uuid4().hex
+    next_run = _compute_next_run(
+        schedule_kind, schedule_time, schedule_weekdays, schedule_interval_days, schedule_datetime,
+        after=datetime.now(),
+    )
+    _insert_automation_rule(
+        conn, rule_id, board_id, "move_task", name, enabled,
+        schedule_kind, schedule_time, schedule_weekdays, schedule_interval_days, schedule_datetime, next_run,
+        from_status=from_status, to_status=to_status,
+    )
+    conn.commit()
+    return get_automation_rule(conn, rule_id)
+
+
+def add_complete_task_rule(
+    conn: sqlite3.Connection, board_id: str, name: str, enabled: bool,
+    schedule_kind: str, schedule_time: str, schedule_weekdays: str, schedule_interval_days, schedule_datetime,
+    from_status: str,
+) -> dict:
+    name = name.strip()
+    if not name:
+        raise ValueError("Rule name cannot be empty.")
+
+    rule_id = uuid.uuid4().hex
+    next_run = _compute_next_run(
+        schedule_kind, schedule_time, schedule_weekdays, schedule_interval_days, schedule_datetime,
+        after=datetime.now(),
+    )
+    _insert_automation_rule(
+        conn, rule_id, board_id, "complete_task", name, enabled,
+        schedule_kind, schedule_time, schedule_weekdays, schedule_interval_days, schedule_datetime, next_run,
+        from_status=from_status,
+    )
+    conn.commit()
+    return get_automation_rule(conn, rule_id)
+
+
+def update_complete_task_rule(
+    conn: sqlite3.Connection, rule_id: str, name: str, enabled: bool,
+    schedule_kind: str, schedule_time: str, schedule_weekdays: str, schedule_interval_days, schedule_datetime,
+    from_status: str,
+) -> None:
+    name = name.strip()
+    if not name:
+        raise ValueError("Rule name cannot be empty.")
+
+    next_run = _compute_next_run(
+        schedule_kind, schedule_time, schedule_weekdays, schedule_interval_days, schedule_datetime,
+        after=datetime.now(),
+    )
+    conn.execute(
+        "UPDATE automation_rules SET name = ?, enabled = ?, schedule_kind = ?, schedule_time = ?, "
+        "schedule_weekdays = ?, schedule_interval_days = ?, schedule_datetime = ?, next_run = ?, "
+        "from_status = ? WHERE id = ?",
+        (name, 1 if enabled else 0, schedule_kind, schedule_time, schedule_weekdays, schedule_interval_days,
+         schedule_datetime, next_run, from_status, rule_id),
+    )
+    conn.commit()
+
+
+def update_create_task_rule(
+    conn: sqlite3.Connection, rule_id: str, name: str, enabled: bool,
+    schedule_kind: str, schedule_time: str, schedule_weekdays: str, schedule_interval_days, schedule_datetime,
+    template_id, task_title: str, task_notes: str, task_status, task_joplin_link: str, task_due_offset_days,
+    subtask_titles: list,
+) -> None:
+    name = name.strip()
+    if not name:
+        raise ValueError("Rule name cannot be empty.")
+
+    next_run = _compute_next_run(
+        schedule_kind, schedule_time, schedule_weekdays, schedule_interval_days, schedule_datetime,
+        after=datetime.now(),
+    )
+    conn.execute(
+        "UPDATE automation_rules SET name = ?, enabled = ?, schedule_kind = ?, schedule_time = ?, "
+        "schedule_weekdays = ?, schedule_interval_days = ?, schedule_datetime = ?, next_run = ?, "
+        "template_id = ?, task_title = ?, task_notes = ?, task_status = ?, task_joplin_link = ?, "
+        "task_due_offset_days = ? WHERE id = ?",
+        (name, 1 if enabled else 0, schedule_kind, schedule_time, schedule_weekdays, schedule_interval_days,
+         schedule_datetime, next_run, template_id, task_title, task_notes, task_status, task_joplin_link,
+         task_due_offset_days, rule_id),
+    )
+    _replace_automation_rule_subtasks(conn, rule_id, subtask_titles)
+    conn.commit()
+
+
+def update_move_task_rule(
+    conn: sqlite3.Connection, rule_id: str, name: str, enabled: bool,
+    schedule_kind: str, schedule_time: str, schedule_weekdays: str, schedule_interval_days, schedule_datetime,
+    from_status: str, to_status: str,
+) -> None:
+    name = name.strip()
+    if not name:
+        raise ValueError("Rule name cannot be empty.")
+    if from_status == to_status:
+        raise ValueError("The \"from\" and \"to\" columns must be different.")
+
+    next_run = _compute_next_run(
+        schedule_kind, schedule_time, schedule_weekdays, schedule_interval_days, schedule_datetime,
+        after=datetime.now(),
+    )
+    conn.execute(
+        "UPDATE automation_rules SET name = ?, enabled = ?, schedule_kind = ?, schedule_time = ?, "
+        "schedule_weekdays = ?, schedule_interval_days = ?, schedule_datetime = ?, next_run = ?, "
+        "from_status = ?, to_status = ? WHERE id = ?",
+        (name, 1 if enabled else 0, schedule_kind, schedule_time, schedule_weekdays, schedule_interval_days,
+         schedule_datetime, next_run, from_status, to_status, rule_id),
+    )
+    conn.commit()
+
+
+def set_automation_rule_enabled(conn: sqlite3.Connection, rule_id: str, enabled: bool) -> None:
+    conn.execute("UPDATE automation_rules SET enabled = ? WHERE id = ?", (1 if enabled else 0, rule_id))
+    conn.commit()
+
+
+def delete_automation_rule(conn: sqlite3.Connection, rule_id: str) -> None:
+    conn.execute("DELETE FROM automation_rule_subtasks WHERE rule_id = ?", (rule_id,))
+    conn.execute("DELETE FROM automation_rules WHERE id = ?", (rule_id,))
+    conn.commit()
+
+
+def get_due_automation_rules(conn: sqlite3.Connection, now: datetime = None) -> list:
+    now = now or datetime.now()
+    rows = conn.execute(
+        "SELECT * FROM automation_rules WHERE enabled = 1 AND next_run IS NOT NULL AND next_run <= ? "
+        "ORDER BY next_run ASC",
+        (now.isoformat(timespec="seconds"),),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _run_create_task_rule(conn: sqlite3.Connection, rule: dict) -> None:
+    if rule["template_id"]:
+        template = get_template(conn, rule["template_id"])
+        if template is None:
+            return  # template was deleted since the rule was created; skip this run
+        title = template["title"]
+        notes = template["notes"]
+        status = template["status"]
+        joplin_link = template["joplin_link"]
+        due_offset_days = template["due_offset_days"]
+        subtask_titles = [s["title"] for s in get_template_subtasks(conn, template["id"])]
+    else:
+        title = rule["task_title"]
+        notes = rule["task_notes"]
+        status = rule["task_status"]
+        joplin_link = rule["task_joplin_link"]
+        due_offset_days = rule["task_due_offset_days"]
+        subtask_titles = [s["title"] for s in get_automation_rule_subtasks(conn, rule["id"])]
+
+    if not title:
+        return
+
+    board_columns = get_columns(conn, rule["board_id"])
+    valid_statuses = {c["status"] for c in board_columns}
+    if status not in valid_statuses:
+        if not board_columns:
+            return
+        status = board_columns[0]["status"]
+
+    due_date = ""
+    if due_offset_days is not None:
+        due_date = (date.today() + timedelta(days=due_offset_days)).strftime("%Y-%m-%d")
+
+    task = add_task(conn, rule["board_id"], title, notes, status)
+    if due_date or joplin_link:
+        update_task(conn, task["id"], title, notes, due_date, joplin_link)
+    for subtask_title in subtask_titles:
+        add_subtask(conn, task["id"], subtask_title)
+
+
+def _run_move_task_rule(conn: sqlite3.Connection, rule: dict) -> None:
+    from_status = rule["from_status"]
+    to_status = rule["to_status"]
+    if not from_status or not to_status:
+        return
+    board_statuses = {c["status"] for c in get_columns(conn, rule["board_id"])}
+    if from_status not in board_statuses or to_status not in board_statuses:
+        return  # a referenced column was deleted since the rule was created; skip this run
+    for task in get_tasks_by_status(conn, rule["board_id"], from_status):
+        move_task(conn, task["id"], to_status)
+
+
+def _run_complete_task_rule(conn: sqlite3.Connection, rule: dict) -> None:
+    from_status = rule["from_status"]
+    if not from_status:
+        return
+    board_statuses = {c["status"] for c in get_columns(conn, rule["board_id"])}
+    if from_status not in board_statuses:
+        return  # the referenced column was deleted since the rule was created; skip this run
+    for task in get_tasks_by_status(conn, rule["board_id"], from_status):
+        if not task["completed"]:
+            set_task_completed(conn, task["id"], True)
+
+
+def run_automation_rule(conn: sqlite3.Connection, rule: dict, now: datetime = None) -> None:
+    now = now or datetime.now()
+    if rule["rule_type"] == "create_task":
+        _run_create_task_rule(conn, rule)
+    elif rule["rule_type"] == "move_task":
+        _run_move_task_rule(conn, rule)
+    elif rule["rule_type"] == "complete_task":
+        _run_complete_task_rule(conn, rule)
+
+    if rule["schedule_kind"] == "once":
+        conn.execute(
+            "UPDATE automation_rules SET last_run = ?, next_run = NULL, enabled = 0 WHERE id = ?",
+            (now.isoformat(timespec="seconds"), rule["id"]),
+        )
+    else:
+        next_run = _compute_next_run(
+            rule["schedule_kind"], rule["schedule_time"], rule["schedule_weekdays"],
+            rule["schedule_interval_days"], rule["schedule_datetime"], after=now,
+        )
+        conn.execute(
+            "UPDATE automation_rules SET last_run = ?, next_run = ? WHERE id = ?",
+            (now.isoformat(timespec="seconds"), next_run, rule["id"]),
+        )
+    conn.commit()
+
+
+def run_due_automation_rules(conn: sqlite3.Connection, now: datetime = None) -> set:
+    now = now or datetime.now()
+    affected_board_ids = set()
+    for rule in get_due_automation_rules(conn, now):
+        run_automation_rule(conn, rule, now)
+        affected_board_ids.add(rule["board_id"])
+    return affected_board_ids
+
+
+def get_board_report(conn: sqlite3.Connection, board_id: str) -> dict:
+    columns = get_columns(conn, board_id)
+    column_counts = []
+    total_tasks = 0
+    overdue_count = 0
+    today_str = date.today().strftime("%Y-%m-%d")
+    recent_count = 0
+    recent_cutoff = (datetime.now() - timedelta(days=7)).isoformat(timespec="seconds")
+    subtasks_total = 0
+    subtasks_done = 0
+
+    for col in columns:
+        tasks = get_tasks_by_status(conn, board_id, col["status"])
+        column_counts.append({"name": col["name"], "status": col["status"], "count": len(tasks)})
+        total_tasks += len(tasks)
+        for task in tasks:
+            if task["due_date"] and task["due_date"] < today_str:
+                overdue_count += 1
+            if task["created"] >= recent_cutoff:
+                recent_count += 1
+            for sub in get_subtasks(conn, task["id"]):
+                subtasks_total += 1
+                if sub["done"]:
+                    subtasks_done += 1
+
+    return {
+        "total_tasks": total_tasks,
+        "column_counts": column_counts,
+        "overdue_count": overdue_count,
+        "recent_count": recent_count,
+        "subtasks_total": subtasks_total,
+        "subtasks_done": subtasks_done,
+    }
+
+
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
@@ -851,6 +1330,14 @@ class TaskCardDialog(QDialog):
         self.status_combo.setCurrentIndex(current_idx)
         layout.addWidget(self.status_combo)
 
+        self.completed_check = QCheckBox("Completed")
+        self.completed_check.setChecked(bool(task.get("completed")))
+        self.completed_check.setToolTip(
+            "Hides this task from the board by default (independent of column) - "
+            "see the \"Show Completed\" toggle to review it again."
+        )
+        layout.addWidget(self.completed_check)
+
         layout.addWidget(QLabel("Due Date"))
         due_row = QHBoxLayout()
         self.due_date_check = QCheckBox("Set")
@@ -912,9 +1399,15 @@ class TaskCardDialog(QDialog):
         save_btn = QPushButton("Save")
         save_btn.setProperty("accent", True)
         save_btn.setDefault(True)
-        save_btn.clicked.connect(self.accept)
+        save_btn.clicked.connect(self._on_save)
         btn_row.addWidget(save_btn)
         layout.addLayout(btn_row)
+
+    def _on_save(self) -> None:
+        if not self.title_edit.text().strip():
+            QMessageBox.warning(self, "Title required", "Task title cannot be empty.")
+            return
+        self.accept()
 
     # -- subtasks (write straight to the database, see class docstring) --
 
@@ -962,6 +1455,7 @@ class TaskCardDialog(QDialog):
             "status": self.status_combo.currentData(),
             "due_date": due_date,
             "joplin_link": self.joplin_link_edit.text().strip(),
+            "completed": self.completed_check.isChecked(),
         }
 
 
@@ -1026,11 +1520,17 @@ class NewTaskDialog(QDialog):
         add_btn = QPushButton("Add Task")
         add_btn.setProperty("accent", True)
         add_btn.setDefault(True)
-        add_btn.clicked.connect(self.accept)
+        add_btn.clicked.connect(self._on_add)
         btn_row.addWidget(add_btn)
         layout.addLayout(btn_row)
 
         self.title_edit.setFocus()
+
+    def _on_add(self) -> None:
+        if not self.title_edit.text().strip():
+            QMessageBox.warning(self, "Title required", "Task title cannot be empty.")
+            return
+        self.accept()
 
     def result_values(self) -> dict:
         due_date = self.due_date_edit.date().toString("yyyy-MM-dd") if self.due_date_check.isChecked() else ""
@@ -1125,11 +1625,17 @@ class TemplateEditorDialog(QDialog):
         save_btn = QPushButton("Save")
         save_btn.setProperty("accent", True)
         save_btn.setDefault(True)
-        save_btn.clicked.connect(self.accept)
+        save_btn.clicked.connect(self._on_save)
         btn_row.addWidget(save_btn)
         layout.addLayout(btn_row)
 
         self.title_edit.setFocus()
+
+    def _on_save(self) -> None:
+        if not self.title_edit.text().strip():
+            QMessageBox.warning(self, "Title required", "Template title cannot be empty.")
+            return
+        self.accept()
 
     def _refresh_subtasks_list(self) -> None:
         self.subtasks_list.clear()
@@ -1227,9 +1733,6 @@ class ManageTemplatesDialog(QDialog):
         if dialog.exec() != QDialog.Accepted:
             return
         values = dialog.result_values()
-        if not values["title"]:
-            QMessageBox.warning(self, "Title required", "Template title cannot be empty.")
-            return
         try:
             add_template(
                 self.conn, self.board_id, values["title"], values["notes"], values["status"],
@@ -1252,9 +1755,6 @@ class ManageTemplatesDialog(QDialog):
         if dialog.exec() != QDialog.Accepted:
             return
         values = dialog.result_values()
-        if not values["title"]:
-            QMessageBox.warning(self, "Title required", "Template title cannot be empty.")
-            return
         try:
             update_template(
                 self.conn, template_id, values["title"], values["notes"], values["status"],
@@ -1291,6 +1791,800 @@ class ManageTemplatesDialog(QDialog):
             if self.templates_list.item(i).data(Qt.UserRole) == template_id:
                 self.templates_list.setCurrentRow(i)
                 break
+
+
+class ScheduleEditorWidget(QWidget):
+    """Reusable "Repeat" sub-form shared by CreateTaskRuleDialog and
+    MoveTaskRuleDialog: a kind selector driving a QStackedWidget with the
+    kind-specific controls. get_values()/set_values() round-trip exactly
+    the fields _compute_next_run() consumes."""
+
+    KIND_LABELS = [
+        ("once", "Once"),
+        ("hourly", "Hourly"),
+        ("daily", "Daily"),
+        ("weekly", "Weekly"),
+        ("interval", "Every N days"),
+    ]
+    WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.kind_combo = QComboBox()
+        for slug, label in self.KIND_LABELS:
+            self.kind_combo.addItem(label, slug)
+        self.kind_combo.currentIndexChanged.connect(self._on_kind_changed)
+        layout.addWidget(self.kind_combo)
+
+        self.stack = QStackedWidget()
+        layout.addWidget(self.stack)
+
+        once_page = QWidget()
+        once_layout = QVBoxLayout(once_page)
+        once_layout.setContentsMargins(0, 0, 0, 0)
+        once_layout.addWidget(QLabel("Date and time"))
+        self.once_edit = QDateTimeEdit()
+        self.once_edit.setCalendarPopup(True)
+        self.once_edit.setDisplayFormat("yyyy-MM-dd HH:mm")
+        self.once_edit.setDateTime(QDateTime.currentDateTime().addSecs(3600))
+        once_layout.addWidget(self.once_edit)
+        self.stack.addWidget(once_page)
+
+        hourly_page = QWidget()
+        hourly_layout = QVBoxLayout(hourly_page)
+        hourly_layout.setContentsMargins(0, 0, 0, 0)
+        hourly_layout.addWidget(QLabel("Every"))
+        self.hourly_spin = QSpinBox()
+        self.hourly_spin.setRange(1, 720)
+        self.hourly_spin.setSuffix(" hour(s)")
+        self.hourly_spin.setValue(1)
+        hourly_layout.addWidget(self.hourly_spin)
+        hourly_layout.addStretch()
+        self.stack.addWidget(hourly_page)
+
+        daily_page = QWidget()
+        daily_layout = QVBoxLayout(daily_page)
+        daily_layout.setContentsMargins(0, 0, 0, 0)
+        daily_layout.addWidget(QLabel("Time of day"))
+        self.daily_time_edit = QTimeEdit()
+        self.daily_time_edit.setDisplayFormat("HH:mm")
+        self.daily_time_edit.setTime(QTime(9, 0))
+        daily_layout.addWidget(self.daily_time_edit)
+        self.stack.addWidget(daily_page)
+
+        weekly_page = QWidget()
+        weekly_layout = QVBoxLayout(weekly_page)
+        weekly_layout.setContentsMargins(0, 0, 0, 0)
+        weekly_layout.addWidget(QLabel("Days"))
+        weekday_row = QHBoxLayout()
+        self.weekday_checks = []
+        for label in self.WEEKDAY_LABELS:
+            cb = QCheckBox(label)
+            weekday_row.addWidget(cb)
+            self.weekday_checks.append(cb)
+        weekly_layout.addLayout(weekday_row)
+        weekly_layout.addWidget(QLabel("Time of day"))
+        self.weekly_time_edit = QTimeEdit()
+        self.weekly_time_edit.setDisplayFormat("HH:mm")
+        self.weekly_time_edit.setTime(QTime(9, 0))
+        weekly_layout.addWidget(self.weekly_time_edit)
+        self.stack.addWidget(weekly_page)
+
+        interval_page = QWidget()
+        interval_layout = QVBoxLayout(interval_page)
+        interval_layout.setContentsMargins(0, 0, 0, 0)
+        interval_layout.addWidget(QLabel("Every"))
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(1, 3650)
+        self.interval_spin.setSuffix(" day(s)")
+        self.interval_spin.setValue(1)
+        interval_layout.addWidget(self.interval_spin)
+        interval_layout.addWidget(QLabel("Time of day"))
+        self.interval_time_edit = QTimeEdit()
+        self.interval_time_edit.setDisplayFormat("HH:mm")
+        self.interval_time_edit.setTime(QTime(9, 0))
+        interval_layout.addWidget(self.interval_time_edit)
+        self.stack.addWidget(interval_page)
+
+        self.kind_combo.setCurrentIndex(2)  # default to Daily
+
+    def _on_kind_changed(self, index: int) -> None:
+        self.stack.setCurrentIndex(index)
+
+    def get_values(self) -> dict:
+        kind = self.kind_combo.currentData()
+        weekdays = ",".join(str(i) for i, cb in enumerate(self.weekday_checks) if cb.isChecked())
+        time_edit = {
+            "daily": self.daily_time_edit,
+            "weekly": self.weekly_time_edit,
+            "interval": self.interval_time_edit,
+        }.get(kind, self.daily_time_edit)
+        # "hourly" reuses the same interval_days column as an hour count
+        # rather than adding a schema column - the two kinds are mutually
+        # exclusive per rule, so there's no ambiguity in what it means.
+        interval_amount = None
+        if kind == "hourly":
+            interval_amount = self.hourly_spin.value()
+        elif kind == "interval":
+            interval_amount = self.interval_spin.value()
+        return {
+            "schedule_kind": kind,
+            "schedule_time": time_edit.time().toString("HH:mm"),
+            "schedule_weekdays": weekdays,
+            "schedule_interval_days": interval_amount,
+            "schedule_datetime": (
+                self.once_edit.dateTime().toString("yyyy-MM-ddTHH:mm:ss") if kind == "once" else None
+            ),
+        }
+
+    def set_values(self, rule: dict) -> None:
+        kind_index = next(
+            (i for i, (slug, _) in enumerate(self.KIND_LABELS) if slug == rule["schedule_kind"]), 2
+        )
+        self.kind_combo.setCurrentIndex(kind_index)
+
+        hh, mm = 9, 0
+        if rule.get("schedule_time"):
+            hh, mm = (int(p) for p in rule["schedule_time"].split(":"))
+        qtime = QTime(hh, mm)
+        self.daily_time_edit.setTime(qtime)
+        self.weekly_time_edit.setTime(qtime)
+        self.interval_time_edit.setTime(qtime)
+
+        weekdays = set()
+        if rule.get("schedule_weekdays"):
+            weekdays = {int(d) for d in rule["schedule_weekdays"].split(",") if d != ""}
+        for i, cb in enumerate(self.weekday_checks):
+            cb.setChecked(i in weekdays)
+
+        if rule.get("schedule_interval_days"):
+            self.interval_spin.setValue(rule["schedule_interval_days"])
+            self.hourly_spin.setValue(rule["schedule_interval_days"])
+
+        if rule.get("schedule_datetime"):
+            qdt = QDateTime.fromString(rule["schedule_datetime"], "yyyy-MM-ddTHH:mm:ss")
+            if qdt.isValid():
+                self.once_edit.setDateTime(qdt)
+
+
+class CreateTaskRuleDialog(QDialog):
+    """Add/edit form for a "create task" automation rule. The task's
+    fields come from either an existing Template (kept live - editing the
+    template afterwards changes what future runs create) or fields
+    entered directly on the rule, toggled by a radio-button pair; the
+    custom-fields form mirrors TemplateEditorDialog's, subtasks staged
+    the same way with no DB writes until Save."""
+
+    def __init__(self, columns: list, templates: list, rule: dict = None, subtask_titles: list = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Create-Task Rule" if rule else "New Create-Task Rule")
+        self.resize(440, 660)
+        self._subtask_titles = list(subtask_titles or [])
+        rule_is_custom = rule is not None and not rule.get("template_id")
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("Rule Name"))
+        self.name_edit = QLineEdit(rule["name"] if rule else "")
+        layout.addWidget(self.name_edit)
+
+        self.enabled_check = QCheckBox("Enabled")
+        self.enabled_check.setChecked((rule["enabled"] == 1) if rule else True)
+        layout.addWidget(self.enabled_check)
+
+        layout.addWidget(QLabel("Schedule"))
+        self.schedule_editor = ScheduleEditorWidget()
+        if rule:
+            self.schedule_editor.set_values(rule)
+        layout.addWidget(self.schedule_editor)
+
+        layout.addWidget(QLabel("Task Source"))
+        source_row = QHBoxLayout()
+        self.template_radio = QRadioButton("Use a Template")
+        self.custom_radio = QRadioButton("Custom fields")
+        source_group = QButtonGroup(self)
+        source_group.addButton(self.template_radio)
+        source_group.addButton(self.custom_radio)
+        source_row.addWidget(self.template_radio)
+        source_row.addWidget(self.custom_radio)
+        layout.addLayout(source_row)
+
+        self.source_stack = QStackedWidget()
+        layout.addWidget(self.source_stack, stretch=1)
+
+        template_page = QWidget()
+        template_layout = QVBoxLayout(template_page)
+        template_layout.setContentsMargins(0, 0, 0, 0)
+        template_layout.addWidget(QLabel("Template"))
+        self.template_combo = QComboBox()
+        for tpl in templates:
+            self.template_combo.addItem(tpl["title"], tpl["id"])
+        template_layout.addWidget(self.template_combo)
+        template_layout.addStretch()
+        self.source_stack.addWidget(template_page)
+
+        custom_page = QWidget()
+        custom_layout = QVBoxLayout(custom_page)
+        custom_layout.setContentsMargins(0, 0, 0, 0)
+
+        custom_layout.addWidget(QLabel("Title"))
+        self.title_edit = QLineEdit(rule["task_title"] if rule_is_custom else "")
+        custom_layout.addWidget(self.title_edit)
+
+        custom_layout.addWidget(QLabel("Column"))
+        self.status_combo = QComboBox()
+        for col in columns:
+            self.status_combo.addItem(col["name"], col["status"])
+        target_status = rule["task_status"] if rule_is_custom else None
+        default_idx = next((i for i, col in enumerate(columns) if col["status"] == target_status), 0)
+        self.status_combo.setCurrentIndex(default_idx)
+        custom_layout.addWidget(self.status_combo)
+
+        custom_layout.addWidget(QLabel("Due Date"))
+        due_row = QHBoxLayout()
+        existing_offset = rule.get("task_due_offset_days") if rule_is_custom else None
+        self.due_date_check = QCheckBox("Set")
+        self.due_date_check.setChecked(existing_offset is not None)
+        due_row.addWidget(self.due_date_check)
+        self.due_offset_spin = QSpinBox()
+        self.due_offset_spin.setRange(0, 3650)
+        self.due_offset_spin.setSuffix(" day(s) from creation")
+        self.due_offset_spin.setValue(existing_offset if existing_offset is not None else 0)
+        self.due_offset_spin.setEnabled(existing_offset is not None)
+        self.due_date_check.toggled.connect(self.due_offset_spin.setEnabled)
+        due_row.addWidget(self.due_offset_spin, stretch=1)
+        custom_layout.addLayout(due_row)
+
+        custom_layout.addWidget(QLabel("Joplin Note Link"))
+        self.joplin_link_edit = QLineEdit(rule["task_joplin_link"] if rule_is_custom else "")
+        self.joplin_link_edit.setPlaceholderText("joplin://... or https://...")
+        custom_layout.addWidget(self.joplin_link_edit)
+
+        custom_layout.addWidget(QLabel("Notes"))
+        self.notes_edit = QTextEdit()
+        self.notes_edit.setPlainText(rule["task_notes"] if rule_is_custom else "")
+        custom_layout.addWidget(self.notes_edit, stretch=1)
+
+        custom_layout.addWidget(QLabel("Subtasks"))
+        self.subtasks_list = QListWidget()
+        custom_layout.addWidget(self.subtasks_list, stretch=1)
+        self._refresh_subtasks_list()
+
+        subtask_add_row = QHBoxLayout()
+        self.new_subtask_edit = QLineEdit()
+        self.new_subtask_edit.setPlaceholderText("New subtask...")
+        self.new_subtask_edit.returnPressed.connect(self._add_subtask)
+        subtask_add_row.addWidget(self.new_subtask_edit)
+        add_subtask_btn = QPushButton("Add")
+        add_subtask_btn.clicked.connect(self._add_subtask)
+        subtask_add_row.addWidget(add_subtask_btn)
+        delete_subtask_btn = QPushButton("Delete")
+        delete_subtask_btn.clicked.connect(self._delete_selected_subtask)
+        subtask_add_row.addWidget(delete_subtask_btn)
+        custom_layout.addLayout(subtask_add_row)
+
+        self.source_stack.addWidget(custom_page)
+
+        self.template_radio.toggled.connect(
+            lambda checked: self.source_stack.setCurrentIndex(0) if checked else None
+        )
+        self.custom_radio.toggled.connect(
+            lambda checked: self.source_stack.setCurrentIndex(1) if checked else None
+        )
+
+        use_template = bool(rule.get("template_id")) if rule else bool(templates)
+        if not templates:
+            self.template_radio.setEnabled(False)
+            use_template = False
+        if use_template:
+            self.template_radio.setChecked(True)
+            if rule and rule.get("template_id"):
+                tpl_idx = next(
+                    (i for i in range(self.template_combo.count())
+                     if self.template_combo.itemData(i) == rule["template_id"]), 0
+                )
+                self.template_combo.setCurrentIndex(tpl_idx)
+        else:
+            self.custom_radio.setChecked(True)
+        self.source_stack.setCurrentIndex(0 if use_template else 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        save_btn = QPushButton("Save")
+        save_btn.setProperty("accent", True)
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self._on_save)
+        btn_row.addWidget(save_btn)
+        layout.addLayout(btn_row)
+
+    def _on_save(self) -> None:
+        if not self.name_edit.text().strip():
+            QMessageBox.warning(self, "Name required", "Rule name cannot be empty.")
+            return
+        if self.custom_radio.isChecked() and not self.title_edit.text().strip():
+            QMessageBox.warning(self, "Title required", "Enter a task title, or switch to using a Template.")
+            return
+        self.accept()
+
+    def _refresh_subtasks_list(self) -> None:
+        self.subtasks_list.clear()
+        for title in self._subtask_titles:
+            self.subtasks_list.addItem(QListWidgetItem(title))
+
+    def _add_subtask(self) -> None:
+        title = self.new_subtask_edit.text().strip()
+        if not title:
+            return
+        self._subtask_titles.append(title)
+        self.new_subtask_edit.clear()
+        self._refresh_subtasks_list()
+
+    def _delete_selected_subtask(self) -> None:
+        row = self.subtasks_list.currentRow()
+        if row < 0:
+            return
+        del self._subtask_titles[row]
+        self._refresh_subtasks_list()
+
+    def result_values(self) -> dict:
+        schedule = self.schedule_editor.get_values()
+        values = {
+            "name": self.name_edit.text().strip(),
+            "enabled": self.enabled_check.isChecked(),
+            **schedule,
+        }
+        if self.template_radio.isChecked():
+            values.update({
+                "template_id": self.template_combo.currentData(),
+                "task_title": "",
+                "task_notes": "",
+                "task_status": None,
+                "task_joplin_link": "",
+                "task_due_offset_days": None,
+                "subtask_titles": [],
+            })
+        else:
+            due_offset_days = self.due_offset_spin.value() if self.due_date_check.isChecked() else None
+            values.update({
+                "template_id": None,
+                "task_title": self.title_edit.text().strip(),
+                "task_notes": self.notes_edit.toPlainText().strip(),
+                "task_status": self.status_combo.currentData(),
+                "task_joplin_link": self.joplin_link_edit.text().strip(),
+                "task_due_offset_days": due_offset_days,
+                "subtask_titles": list(self._subtask_titles),
+            })
+        return values
+
+
+class MoveTaskRuleDialog(QDialog):
+    """Add/edit form for a "move tasks" automation rule: at the scheduled
+    time, every task currently in the "from" column moves to the "to"
+    column."""
+
+    def __init__(self, columns: list, rule: dict = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Move-Task Rule" if rule else "New Move-Task Rule")
+        self.resize(400, 440)
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("Rule Name"))
+        self.name_edit = QLineEdit(rule["name"] if rule else "")
+        layout.addWidget(self.name_edit)
+
+        self.enabled_check = QCheckBox("Enabled")
+        self.enabled_check.setChecked((rule["enabled"] == 1) if rule else True)
+        layout.addWidget(self.enabled_check)
+
+        layout.addWidget(QLabel("Schedule"))
+        self.schedule_editor = ScheduleEditorWidget()
+        if rule:
+            self.schedule_editor.set_values(rule)
+        layout.addWidget(self.schedule_editor)
+
+        layout.addWidget(QLabel("Move tasks from"))
+        self.from_combo = QComboBox()
+        for col in columns:
+            self.from_combo.addItem(col["name"], col["status"])
+        layout.addWidget(self.from_combo)
+
+        layout.addWidget(QLabel("to"))
+        self.to_combo = QComboBox()
+        for col in columns:
+            self.to_combo.addItem(col["name"], col["status"])
+        layout.addWidget(self.to_combo)
+
+        if rule:
+            from_idx = next((i for i, col in enumerate(columns) if col["status"] == rule["from_status"]), 0)
+            to_idx = next((i for i, col in enumerate(columns) if col["status"] == rule["to_status"]), 0)
+            self.from_combo.setCurrentIndex(from_idx)
+            self.to_combo.setCurrentIndex(to_idx)
+        elif len(columns) > 1:
+            self.to_combo.setCurrentIndex(1)
+
+        layout.addStretch()
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        save_btn = QPushButton("Save")
+        save_btn.setProperty("accent", True)
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self._on_save)
+        btn_row.addWidget(save_btn)
+        layout.addLayout(btn_row)
+
+    def _on_save(self) -> None:
+        if not self.name_edit.text().strip():
+            QMessageBox.warning(self, "Name required", "Rule name cannot be empty.")
+            return
+        if self.from_combo.currentData() == self.to_combo.currentData():
+            QMessageBox.warning(self, "Invalid columns", 'The "from" and "to" columns must be different.')
+            return
+        self.accept()
+
+    def result_values(self) -> dict:
+        schedule = self.schedule_editor.get_values()
+        return {
+            "name": self.name_edit.text().strip(),
+            "enabled": self.enabled_check.isChecked(),
+            "from_status": self.from_combo.currentData(),
+            "to_status": self.to_combo.currentData(),
+            **schedule,
+        }
+
+
+class CompleteTaskRuleDialog(QDialog):
+    """Add/edit form for a "complete tasks" automation rule: at the
+    scheduled time, every task currently in the chosen column is marked
+    complete (they stay in that column - completion is independent of
+    column, see set_task_completed())."""
+
+    def __init__(self, columns: list, rule: dict = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Complete-Task Rule" if rule else "New Complete-Task Rule")
+        self.resize(400, 380)
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("Rule Name"))
+        self.name_edit = QLineEdit(rule["name"] if rule else "")
+        layout.addWidget(self.name_edit)
+
+        self.enabled_check = QCheckBox("Enabled")
+        self.enabled_check.setChecked((rule["enabled"] == 1) if rule else True)
+        layout.addWidget(self.enabled_check)
+
+        layout.addWidget(QLabel("Schedule"))
+        self.schedule_editor = ScheduleEditorWidget()
+        if rule:
+            self.schedule_editor.set_values(rule)
+        layout.addWidget(self.schedule_editor)
+
+        layout.addWidget(QLabel("Complete tasks in"))
+        self.from_combo = QComboBox()
+        for col in columns:
+            self.from_combo.addItem(col["name"], col["status"])
+        layout.addWidget(self.from_combo)
+
+        if rule:
+            from_idx = next((i for i, col in enumerate(columns) if col["status"] == rule["from_status"]), 0)
+            self.from_combo.setCurrentIndex(from_idx)
+
+        layout.addStretch()
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        save_btn = QPushButton("Save")
+        save_btn.setProperty("accent", True)
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self._on_save)
+        btn_row.addWidget(save_btn)
+        layout.addLayout(btn_row)
+
+    def _on_save(self) -> None:
+        if not self.name_edit.text().strip():
+            QMessageBox.warning(self, "Name required", "Rule name cannot be empty.")
+            return
+        self.accept()
+
+    def result_values(self) -> dict:
+        schedule = self.schedule_editor.get_values()
+        return {
+            "name": self.name_edit.text().strip(),
+            "enabled": self.enabled_check.isChecked(),
+            "from_status": self.from_combo.currentData(),
+            **schedule,
+        }
+
+
+def _describe_schedule(rule: dict) -> str:
+    kind = rule["schedule_kind"]
+    if kind == "once":
+        return f"Once at {rule['schedule_datetime'] or '?'}"
+    if kind == "hourly":
+        return f"Every {rule['schedule_interval_days']} hour(s)"
+    if kind == "daily":
+        return f"Daily at {rule['schedule_time']}"
+    if kind == "weekly":
+        names = ScheduleEditorWidget.WEEKDAY_LABELS
+        days = [names[int(d)] for d in rule["schedule_weekdays"].split(",") if d != ""]
+        return f"Weekly on {', '.join(days) or '?'} at {rule['schedule_time']}"
+    if kind == "interval":
+        return f"Every {rule['schedule_interval_days']} day(s) at {rule['schedule_time']}"
+    return kind
+
+
+class ManageAutomationsDialog(QDialog):
+    """Lists a board's automation rules (both create-task and move-task)
+    with add/edit/delete/enable-toggle controls, mirroring
+    ManageTemplatesDialog's immediate-write pattern."""
+
+    def __init__(self, conn: sqlite3.Connection, board_id: str, columns: list, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.board_id = board_id
+        self.columns = columns
+        self.setWindowTitle("Manage Automation")
+        self.resize(460, 480)
+
+        layout = QVBoxLayout(self)
+
+        self.rules_list = QListWidget()
+        self.rules_list.itemChanged.connect(self._on_item_changed)
+        self.rules_list.itemDoubleClicked.connect(lambda _item: self._edit_selected())
+        layout.addWidget(self.rules_list, stretch=1)
+
+        add_row = QHBoxLayout()
+        add_create_btn = QPushButton("+ Create Task Rule")
+        add_create_btn.clicked.connect(self._add_create_task_rule)
+        add_row.addWidget(add_create_btn)
+        add_move_btn = QPushButton("+ Move Tasks Rule")
+        add_move_btn.clicked.connect(self._add_move_task_rule)
+        add_row.addWidget(add_move_btn)
+        add_complete_btn = QPushButton("+ Complete Task Rule")
+        add_complete_btn.clicked.connect(self._add_complete_task_rule)
+        add_row.addWidget(add_complete_btn)
+        layout.addLayout(add_row)
+
+        btn_row = QHBoxLayout()
+        edit_btn = QPushButton("Edit")
+        edit_btn.clicked.connect(self._edit_selected)
+        btn_row.addWidget(edit_btn)
+        delete_btn = QPushButton("Delete")
+        delete_btn.setStyleSheet("color: #b00000;")
+        delete_btn.clicked.connect(self._delete_selected)
+        btn_row.addWidget(delete_btn)
+        btn_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setDefault(True)
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        self.refresh()
+
+    def refresh(self) -> None:
+        self.rules_list.blockSignals(True)
+        self.rules_list.clear()
+        type_labels = {
+            "create_task": "Create Task",
+            "move_task": "Move Tasks",
+            "complete_task": "Complete Tasks",
+        }
+        for rule in get_automation_rules(self.conn, self.board_id):
+            type_label = type_labels.get(rule["rule_type"], rule["rule_type"])
+            text = f'{rule["name"]}  ·  {type_label}  ·  {_describe_schedule(rule)}'
+            item = QListWidgetItem(text)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if rule["enabled"] else Qt.Unchecked)
+            item.setData(Qt.UserRole, rule["id"])
+            self.rules_list.addItem(item)
+        self.rules_list.blockSignals(False)
+
+    def _on_item_changed(self, item: QListWidgetItem) -> None:
+        rule_id = item.data(Qt.UserRole)
+        set_automation_rule_enabled(self.conn, rule_id, item.checkState() == Qt.Checked)
+
+    def _selected_rule_id(self):
+        item = self.rules_list.currentItem()
+        return item.data(Qt.UserRole) if item is not None else None
+
+    def _current_templates(self) -> list:
+        return get_templates(self.conn, self.board_id)
+
+    def _add_create_task_rule(self) -> None:
+        dialog = CreateTaskRuleDialog(self.columns, self._current_templates(), parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        values = dialog.result_values()
+        try:
+            add_create_task_rule(
+                self.conn, self.board_id, values["name"], values["enabled"],
+                values["schedule_kind"], values["schedule_time"], values["schedule_weekdays"],
+                values["schedule_interval_days"], values["schedule_datetime"],
+                values["template_id"], values["task_title"], values["task_notes"], values["task_status"],
+                values["task_joplin_link"], values["task_due_offset_days"], values["subtask_titles"],
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "Could not add rule", str(e))
+            return
+        self.refresh()
+
+    def _add_move_task_rule(self) -> None:
+        if len(self.columns) < 2:
+            QMessageBox.information(
+                self, "Not enough columns", "This board needs at least two columns to move tasks between."
+            )
+            return
+        dialog = MoveTaskRuleDialog(self.columns, parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        values = dialog.result_values()
+        try:
+            add_move_task_rule(
+                self.conn, self.board_id, values["name"], values["enabled"],
+                values["schedule_kind"], values["schedule_time"], values["schedule_weekdays"],
+                values["schedule_interval_days"], values["schedule_datetime"],
+                values["from_status"], values["to_status"],
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "Could not add rule", str(e))
+            return
+        self.refresh()
+
+    def _add_complete_task_rule(self) -> None:
+        dialog = CompleteTaskRuleDialog(self.columns, parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        values = dialog.result_values()
+        try:
+            add_complete_task_rule(
+                self.conn, self.board_id, values["name"], values["enabled"],
+                values["schedule_kind"], values["schedule_time"], values["schedule_weekdays"],
+                values["schedule_interval_days"], values["schedule_datetime"],
+                values["from_status"],
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "Could not add rule", str(e))
+            return
+        self.refresh()
+
+    def _edit_selected(self) -> None:
+        rule_id = self._selected_rule_id()
+        if rule_id is None:
+            return
+        rule = get_automation_rule(self.conn, rule_id)
+        if rule is None:
+            return
+
+        if rule["rule_type"] == "create_task":
+            subtask_titles = [s["title"] for s in get_automation_rule_subtasks(self.conn, rule_id)]
+            dialog = CreateTaskRuleDialog(
+                self.columns, self._current_templates(),
+                rule=rule, subtask_titles=subtask_titles, parent=self,
+            )
+            if dialog.exec() != QDialog.Accepted:
+                return
+            values = dialog.result_values()
+            try:
+                update_create_task_rule(
+                    self.conn, rule_id, values["name"], values["enabled"],
+                    values["schedule_kind"], values["schedule_time"], values["schedule_weekdays"],
+                    values["schedule_interval_days"], values["schedule_datetime"],
+                    values["template_id"], values["task_title"], values["task_notes"], values["task_status"],
+                    values["task_joplin_link"], values["task_due_offset_days"], values["subtask_titles"],
+                )
+            except ValueError as e:
+                QMessageBox.warning(self, "Could not update rule", str(e))
+                return
+        elif rule["rule_type"] == "move_task":
+            dialog = MoveTaskRuleDialog(self.columns, rule=rule, parent=self)
+            if dialog.exec() != QDialog.Accepted:
+                return
+            values = dialog.result_values()
+            try:
+                update_move_task_rule(
+                    self.conn, rule_id, values["name"], values["enabled"],
+                    values["schedule_kind"], values["schedule_time"], values["schedule_weekdays"],
+                    values["schedule_interval_days"], values["schedule_datetime"],
+                    values["from_status"], values["to_status"],
+                )
+            except ValueError as e:
+                QMessageBox.warning(self, "Could not update rule", str(e))
+                return
+        else:
+            dialog = CompleteTaskRuleDialog(self.columns, rule=rule, parent=self)
+            if dialog.exec() != QDialog.Accepted:
+                return
+            values = dialog.result_values()
+            try:
+                update_complete_task_rule(
+                    self.conn, rule_id, values["name"], values["enabled"],
+                    values["schedule_kind"], values["schedule_time"], values["schedule_weekdays"],
+                    values["schedule_interval_days"], values["schedule_datetime"],
+                    values["from_status"],
+                )
+            except ValueError as e:
+                QMessageBox.warning(self, "Could not update rule", str(e))
+                return
+
+        self.refresh()
+
+    def _delete_selected(self) -> None:
+        rule_id = self._selected_rule_id()
+        if rule_id is None:
+            return
+        rule = get_automation_rule(self.conn, rule_id)
+        if rule is None:
+            return
+        reply = QMessageBox.question(
+            self, "Delete rule", f'Delete the "{rule["name"]}" rule?',
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        delete_automation_rule(self.conn, rule_id)
+        self.refresh()
+
+
+class BoardReportDialog(QDialog):
+    """Read-only per-board stat sheet. No export yet - more report types
+    and formats are expected to build on this first pass."""
+
+    def __init__(self, conn: sqlite3.Connection, board_id: str, board_name: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Report — {board_name}")
+        self.resize(360, 420)
+
+        report = get_board_report(conn, board_id)
+
+        layout = QVBoxLayout(self)
+
+        total_label = QLabel(f"Total tasks: {report['total_tasks']}")
+        total_label.setStyleSheet("font-weight: bold; font-size: 14px;")
+        layout.addWidget(total_label)
+
+        layout.addWidget(QLabel("By column:"))
+        for col in report["column_counts"]:
+            layout.addWidget(QLabel(f'    {col["name"]}: {col["count"]}'))
+
+        spacer = QLabel("")
+        layout.addWidget(spacer)
+
+        overdue_label = QLabel(f"Overdue tasks: {report['overdue_count']}")
+        if report["overdue_count"]:
+            overdue_label.setStyleSheet("color: #e05252;")
+        layout.addWidget(overdue_label)
+
+        layout.addWidget(QLabel(f"Created in the last 7 days: {report['recent_count']}"))
+
+        if report["subtasks_total"]:
+            pct = round(100 * report["subtasks_done"] / report["subtasks_total"])
+            layout.addWidget(QLabel(
+                f"Subtasks done: {report['subtasks_done']}/{report['subtasks_total']} ({pct}%)"
+            ))
+        else:
+            layout.addWidget(QLabel("Subtasks done: —"))
+
+        layout.addStretch()
+
+        close_btn = QPushButton("Close")
+        close_btn.setDefault(True)
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn)
 
 
 class QuickAddDialog(QDialog):
@@ -1429,10 +2723,15 @@ class TaskListWidget(QListWidget):
         self.itemDoubleClicked.connect(self._on_double_click)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_context_menu)
+        self.itemChanged.connect(self._on_item_changed)
 
     def _on_double_click(self, item):
         task_id = item.data(Qt.UserRole)
         self.board.edit_task(task_id)
+
+    def _on_item_changed(self, item: QListWidgetItem) -> None:
+        task_id = item.data(Qt.UserRole)
+        self.board.handle_set_completed(task_id, item.checkState() == Qt.Checked)
 
     def _on_context_menu(self, pos) -> None:
         item = self.itemAt(pos)
@@ -1695,6 +2994,7 @@ class KanbanBoard(QWidget):
         self._board_panel_open = False
         self._board_panel_anim = None
         self._quick_add_dialog = None
+        self.show_completed = False
 
         outer = QVBoxLayout(self)
 
@@ -1716,12 +3016,30 @@ class KanbanBoard(QWidget):
         self.add_task_btn.setMenu(self.new_task_menu)
         toolbar.addWidget(self.add_task_btn)
 
+        self.automation_btn = QPushButton("Automation")
+        self.automation_btn.setToolTip("Manage scheduled task-creation and column-move rules for this board")
+        self.automation_btn.clicked.connect(self.manage_automations_ui)
+        toolbar.addWidget(self.automation_btn)
+
+        self.report_btn = QPushButton("Report")
+        self.report_btn.setToolTip("View a summary report for this board")
+        self.report_btn.clicked.connect(self.show_report_ui)
+        toolbar.addWidget(self.report_btn)
+
         toolbar.addStretch()
 
         self.add_col_btn = QPushButton("+ Column")
         self.add_col_btn.clicked.connect(self.add_column_ui)
         self.add_col_btn.hide()
         toolbar.addWidget(self.add_col_btn)
+
+        self.show_completed_btn = QPushButton("Show Completed")
+        self.show_completed_btn.setCheckable(True)
+        self.show_completed_btn.setToolTip(
+            "Completed tasks are hidden from their column by default - toggle this to review them"
+        )
+        self.show_completed_btn.toggled.connect(self._on_show_completed_toggled)
+        toolbar.addWidget(self.show_completed_btn)
 
         self.edit_board_btn = QPushButton("Edit Board")
         self.edit_board_btn.setCheckable(True)
@@ -1743,6 +3061,16 @@ class KanbanBoard(QWidget):
         self.board_panel.hide()
 
         self.rebuild_boards_selector()
+
+        # Automation rules only ever run while Kanvas is open (no background
+        # service) - this timer plus one immediate check below is the whole
+        # execution model. See the "Task automation" section in the data
+        # layer for how a rule catches up after being closed past its
+        # scheduled time.
+        self._automation_timer = QTimer(self)
+        self._automation_timer.timeout.connect(self._run_due_automations)
+        self._automation_timer.start(60_000)
+        self._run_due_automations()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -1874,12 +3202,21 @@ class KanbanBoard(QWidget):
         for col_widget in self.columns.values():
             col_widget.set_edit_controls_visible(checked)
 
+    def _on_show_completed_toggled(self, checked: bool) -> None:
+        self.show_completed = checked
+        self.refresh()
+
     # -- lightweight refresh (task list contents only) ------------------
 
     def refresh(self) -> None:
         for status, col_widget in self.columns.items():
-            col_widget.list_widget.clear()
-            tasks = get_tasks_by_status(self.conn, self.current_board_id, status)
+            list_widget = col_widget.list_widget
+            list_widget.blockSignals(True)
+            list_widget.clear()
+
+            all_tasks = get_tasks_by_status(self.conn, self.current_board_id, status)
+            tasks = all_tasks if self.show_completed else [t for t in all_tasks if not t["completed"]]
+
             for task in tasks:
                 subtasks = get_subtasks(self.conn, task["id"])
 
@@ -1898,6 +3235,13 @@ class KanbanBoard(QWidget):
 
                 item = QListWidgetItem(card_text)
                 item.setData(Qt.UserRole, task["id"])
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked if task["completed"] else Qt.Unchecked)
+                if task["completed"]:
+                    font = item.font()
+                    font.setStrikeOut(True)
+                    item.setFont(font)
+                    item.setForeground(QColor("#767676"))
 
                 tooltip_lines = []
                 if task.get("due_date"):
@@ -1909,7 +3253,9 @@ class KanbanBoard(QWidget):
                 if tooltip_lines:
                     item.setToolTip("\n".join(tooltip_lines))
 
-                col_widget.list_widget.addItem(item)
+                list_widget.addItem(item)
+
+            list_widget.blockSignals(False)
             col_widget.set_count(len(tasks))
 
     # -- task operations ------------------------------------------------
@@ -1941,10 +3287,6 @@ class KanbanBoard(QWidget):
             return
 
         values = dialog.result_values()
-        if not values["title"]:
-            QMessageBox.warning(self, "Title required", "Task title cannot be empty.")
-            return
-
         task = add_task(self.conn, self.current_board_id, values["title"], values["notes"], values["status"])
         if values["due_date"] or values["joplin_link"]:
             update_task(
@@ -1977,6 +3319,26 @@ class KanbanBoard(QWidget):
         dialog.exec()
         self._rebuild_new_task_menu()
 
+    # -- automation (scheduled task-creation / column-move rules) --------
+
+    def manage_automations_ui(self) -> None:
+        if not self._columns_cache:
+            QMessageBox.information(self, "No columns", "Add a column first.")
+            return
+        dialog = ManageAutomationsDialog(self.conn, self.current_board_id, self._columns_cache, self)
+        dialog.exec()
+
+    def show_report_ui(self) -> None:
+        if not self.current_board_id:
+            return
+        dialog = BoardReportDialog(self.conn, self.current_board_id, self._current_board_name(), self)
+        dialog.exec()
+
+    def _run_due_automations(self) -> None:
+        affected_board_ids = run_due_automation_rules(self.conn)
+        if self.current_board_id in affected_board_ids:
+            self.refresh()
+
     def edit_task(self, task_id: str) -> None:
         task = get_task(self.conn, task_id)
         if not task:
@@ -1992,16 +3354,14 @@ class KanbanBoard(QWidget):
             return
 
         values = dialog.result_values()
-        if not values["title"]:
-            QMessageBox.warning(self, "Title required", "Task title cannot be empty.")
-            return
-
         update_task(
             self.conn, task_id, values["title"], values["notes"],
             values["due_date"], values["joplin_link"],
         )
         if values["status"] and values["status"] != task["status"]:
             move_task(self.conn, task_id, values["status"])
+        if values["completed"] != bool(task["completed"]):
+            set_task_completed(self.conn, task_id, values["completed"])
         self.refresh()
 
     def handle_move(self, task_id: str, new_status: str) -> None:
@@ -2010,6 +3370,13 @@ class KanbanBoard(QWidget):
             return
         move_task(self.conn, task_id, new_status)
         self.refresh()
+
+    def handle_set_completed(self, task_id: str, completed: bool) -> None:
+        set_task_completed(self.conn, task_id, completed)
+        # Deferred: this fires from inside the card's own checkbox-toggle
+        # signal, and refresh() rebuilds (clears) that same list widget -
+        # doing that synchronously would modify the list mid-signal.
+        QTimer.singleShot(0, self.refresh)
 
     def show_move_task_menu(self, task_id: str, current_status: str, global_pos) -> None:
         menu = QMenu(self)
