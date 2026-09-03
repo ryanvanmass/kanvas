@@ -64,10 +64,10 @@ pip install pyinstaller
 ### Windows (.exe)
 
 ```bash
-pyinstaller --onefile --windowed --name kanvas kanvas.py
+pyinstaller --onefile --windowed --name kanvas --icon assets\kanvas_logo.ico --add-data "assets;assets" kanvas.py
 ```
 
-The executable is written to `dist/kanvas.exe`.
+The executable is written to `dist/kanvas.exe`. Both flags matter: `--icon` sets the icon Explorer/the taskbar show for the .exe file itself, and `--add-data` bundles the `assets/` folder into the executable so the app can still find it at runtime (without it, the app's own `setWindowIcon()` call silently finds nothing and the title bar/taskbar icon stays blank even though the .exe file's icon looks fine).
 
 ### Linux (.deb / .rpm)
 
@@ -75,7 +75,7 @@ Linux packages are easiest to build with [fpm](https://github.com/jordansissel/f
 
 ```bash
 # 1. Freeze the app into a folder
-pyinstaller --onedir --windowed --name kanvas kanvas.py
+pyinstaller --onedir --windowed --name kanvas --add-data "assets:assets" kanvas.py
 
 # 2. Install fpm (needs Ruby)
 sudo dnf install ruby ruby-devel gcc make rpm-build   # Fedora
