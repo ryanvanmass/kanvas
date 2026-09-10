@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QInputDialog, QMessageBox, QDialog, QLineEdit, QTextEdit,
     QCheckBox, QDateEdit, QSpinBox, QMenu, QToolButton, QStackedWidget,
     QDateTimeEdit, QTimeEdit, QRadioButton, QButtonGroup, QSystemTrayIcon,
+    QTableWidget, QTableWidgetItem, QHeaderView,
 )
 
 APP_TITLE = "Kanvas"
@@ -65,6 +66,21 @@ DEFAULT_COLUMNS = [
 
 DEFAULT_FIRST_BOARD_NAME = "My Board"
 LEGACY_BOARD_NAME = "Default"
+
+# ---------------------------------------------------------------------------
+# Projects - a second, parallel feature (see init_db's project_* tables
+# below). Fully isolated from the Boards feature above: no shared tables,
+# no shared UI state, no shared code paths beyond generic app scaffolding.
+# ---------------------------------------------------------------------------
+
+# Seed columns for a newly created project board (Main Board or sub-board).
+# Unlike DEFAULT_COLUMNS, project_columns.id is a real primary key rather
+# than a slug derived from the name, so only names are needed here.
+PROJECT_DEFAULT_COLUMNS = ["Today", "In Progress", "Blocked", "Complete"]
+
+# Soft warning threshold for sub-board nesting depth (Main Board = depth 1).
+# Nothing blocks creation past this depth - it's just a nudge.
+PROJECT_BOARD_DEPTH_WARNING_THRESHOLD = 10
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +328,91 @@ def init_db(conn: sqlite3.Connection) -> None:
             rule_id TEXT NOT NULL,
             title TEXT NOT NULL,
             position INTEGER NOT NULL
+        )
+    """)
+
+    # -- Projects (see the "Projects" comment block above DEFAULT_FIRST_BOARD_NAME) --
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS projects (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            main_board_id TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS project_boards (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            parent_task_id TEXT UNIQUE,
+            name TEXT NOT NULL,
+            last_view TEXT NOT NULL DEFAULT 'kanban',
+            position INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS project_columns (
+            id TEXT PRIMARY KEY,
+            board_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            position INTEGER NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS project_tasks (
+            id TEXT PRIMARY KEY,
+            board_id TEXT NOT NULL,
+            column_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            notes TEXT NOT NULL DEFAULT '',
+            start_date TEXT,
+            due_date TEXT,
+            completed INTEGER NOT NULL DEFAULT 0,
+            position INTEGER NOT NULL,
+            link TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS project_subtasks (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            done INTEGER NOT NULL DEFAULT 0,
+            position INTEGER NOT NULL
+        )
+    """)
+    # project_documents and project_activity_log are created now (so later
+    # phases land without a migration) but get no CRUD or UI yet - nothing
+    # writes to them in this phase.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS project_documents (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            path_or_url TEXT NOT NULL,
+            label TEXT NOT NULL,
+            notes TEXT,
+            position INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS project_activity_log (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            board_id TEXT,
+            task_id TEXT,
+            task_title_snapshot TEXT NOT NULL DEFAULT '',
+            board_path_snapshot TEXT NOT NULL DEFAULT '',
+            action_type TEXT NOT NULL,
+            field_name TEXT,
+            old_value TEXT,
+            new_value TEXT,
+            description TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
         )
     """)
     conn.commit()
@@ -1176,6 +1277,529 @@ def get_board_report(conn: sqlite3.Connection, board_id: str) -> dict:
         "subtasks_total": subtasks_total,
         "subtasks_done": subtasks_done,
     }
+
+
+# ---------------------------------------------------------------------------
+# Projects (fully separate from Boards above - see the module-level comment
+# near PROJECT_DEFAULT_COLUMNS). A Project has exactly one Main Board;
+# any task on any Projects board can spawn one Sub-board of its own, to
+# unlimited depth. Tasks never move between boards once created, and a
+# sub-board's parent is always a task on some existing board, so the board
+# tree can only grow downward - no cycle-guard is needed anywhere below.
+# ---------------------------------------------------------------------------
+
+# -- Projects -----------------------------------------------------------
+
+def get_projects(conn: sqlite3.Connection) -> list:
+    rows = conn.execute("SELECT * FROM projects ORDER BY position ASC").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_project(conn: sqlite3.Connection, project_id: str):
+    row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def add_project(conn: sqlite3.Connection, name: str) -> dict:
+    name = name.strip()
+    if not name:
+        raise ValueError("Project name cannot be empty.")
+
+    max_position_row = conn.execute("SELECT MAX(position) AS m FROM projects").fetchone()
+    next_position = (max_position_row["m"] + 1) if max_position_row["m"] is not None else 0
+
+    project_id = uuid.uuid4().hex
+    conn.execute(
+        "INSERT INTO projects (id, name, position, created_at, main_board_id) VALUES (?, ?, ?, ?, NULL)",
+        (project_id, name, next_position, _now()),
+    )
+    conn.commit()
+
+    main_board = add_project_board(conn, project_id, None, name)
+    conn.execute("UPDATE projects SET main_board_id = ? WHERE id = ?", (main_board["id"], project_id))
+    conn.commit()
+
+    return get_project(conn, project_id)
+
+
+def rename_project(conn: sqlite3.Connection, project_id: str, new_name: str) -> None:
+    """Renames only the project itself - its Main Board keeps whatever name
+    it already has. project_boards.name only defaults to the project name
+    at creation time (see add_project_board), it isn't kept in sync."""
+    new_name = new_name.strip()
+    if not new_name:
+        raise ValueError("Project name cannot be empty.")
+    conn.execute("UPDATE projects SET name = ? WHERE id = ?", (new_name, project_id))
+    conn.commit()
+
+
+def _compact_project_positions(conn: sqlite3.Connection) -> None:
+    for position, p in enumerate(get_projects(conn)):
+        if p["position"] != position:
+            conn.execute("UPDATE projects SET position = ? WHERE id = ?", (position, p["id"]))
+    conn.commit()
+
+
+def move_project(conn: sqlite3.Connection, project_id: str, direction: int) -> None:
+    projects = get_projects(conn)
+    ids = [p["id"] for p in projects]
+    if project_id not in ids:
+        return
+
+    idx = ids.index(project_id)
+    new_idx = idx + direction
+    if new_idx < 0 or new_idx >= len(projects):
+        return
+
+    projects[idx], projects[new_idx] = projects[new_idx], projects[idx]
+    for position, p in enumerate(projects):
+        conn.execute("UPDATE projects SET position = ? WHERE id = ?", (position, p["id"]))
+    conn.commit()
+
+
+def delete_project(conn: sqlite3.Connection, project_id: str) -> None:
+    """Deletes a project along with its entire board tree (every board,
+    column, task and subtask reachable from the Main Board) and its
+    Document Library. Deliberately does NOT touch project_activity_log -
+    even though nothing writes to it yet in this phase, log entries are
+    meant to be a permanent audit trail (see the Activity Log's future
+    permanence requirement) and should survive a project delete once
+    that feature is built."""
+    project = get_project(conn, project_id)
+    if project is not None and project.get("main_board_id"):
+        delete_project_board(conn, project["main_board_id"])
+
+    conn.execute("DELETE FROM project_documents WHERE project_id = ?", (project_id,))
+    conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+    conn.commit()
+    _compact_project_positions(conn)
+
+
+# -- Project boards (Main Board or Sub-board - same shape, same tables) --
+
+def get_project_board(conn: sqlite3.Connection, board_id: str):
+    row = conn.execute("SELECT * FROM project_boards WHERE id = ?", (board_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def get_subboard_for_task(conn: sqlite3.Connection, task_id: str):
+    """A task owns at most one sub-board, enforced by the UNIQUE constraint
+    on project_boards.parent_task_id."""
+    row = conn.execute(
+        "SELECT * FROM project_boards WHERE parent_task_id = ?", (task_id,)
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def add_project_board(
+    conn: sqlite3.Connection, project_id: str, parent_task_id, name: str,
+    seed_default_columns: bool = True,
+) -> dict:
+    """Low-level board creation - parent_task_id=None makes a Main Board,
+    otherwise a sub-board owned by that task. Kept separate from
+    add_subboard_for_task() (which resolves project_id/default name from
+    the task) so a future whole-project clone/template operation can call
+    this directly without duplicating the seeding logic."""
+    name = name.strip() or "Untitled Board"
+
+    max_position_row = conn.execute(
+        "SELECT MAX(position) AS m FROM project_boards WHERE project_id = ?", (project_id,)
+    ).fetchone()
+    next_position = (max_position_row["m"] + 1) if max_position_row["m"] is not None else 0
+
+    board_id = uuid.uuid4().hex
+    conn.execute(
+        "INSERT INTO project_boards (id, project_id, parent_task_id, name, last_view, position, created_at) "
+        "VALUES (?, ?, ?, ?, 'kanban', ?, ?)",
+        (board_id, project_id, parent_task_id, name, next_position, _now()),
+    )
+    conn.commit()
+
+    if seed_default_columns:
+        for position, col_name in enumerate(PROJECT_DEFAULT_COLUMNS):
+            conn.execute(
+                "INSERT INTO project_columns (id, board_id, name, position) VALUES (?, ?, ?, ?)",
+                (uuid.uuid4().hex, board_id, col_name, position),
+            )
+        conn.commit()
+
+    return get_project_board(conn, board_id)
+
+
+def add_subboard_for_task(conn: sqlite3.Connection, parent_task_id: str) -> dict:
+    """Higher-level entry point used by the UI: resolves the owning
+    project and a default name (the parent task's title) from the task,
+    then delegates to add_project_board(). Raises if the task already
+    owns a sub-board - callers should check get_subboard_for_task() first
+    if they want to distinguish "already exists" from "just created"."""
+    if get_subboard_for_task(conn, parent_task_id) is not None:
+        raise ValueError("This task already has a sub-board.")
+
+    task = get_project_task(conn, parent_task_id)
+    if task is None:
+        raise ValueError("That task no longer exists.")
+    parent_board = get_project_board(conn, task["board_id"])
+    if parent_board is None:
+        raise ValueError("That task's board no longer exists.")
+
+    return add_project_board(conn, parent_board["project_id"], parent_task_id, task["title"])
+
+
+def set_board_last_view(conn: sqlite3.Connection, board_id: str, view_name: str) -> None:
+    conn.execute("UPDATE project_boards SET last_view = ? WHERE id = ?", (view_name, board_id))
+    conn.commit()
+
+
+def get_board_ancestry(conn: sqlite3.Connection, board_id: str) -> list:
+    """Main Board first, board_id last. Walks upward: each board's
+    parent_task_id names the task that spawned it, and that task's
+    board_id names the parent board - repeat until parent_task_id is
+    NULL (the Main Board)."""
+    chain = []
+    current = get_project_board(conn, board_id)
+    while current is not None:
+        chain.append(current)
+        if current["parent_task_id"] is None:
+            break
+        parent_task = get_project_task(conn, current["parent_task_id"])
+        current = get_project_board(conn, parent_task["board_id"]) if parent_task else None
+    chain.reverse()
+    return chain
+
+
+def get_board_breadcrumb(conn: sqlite3.Connection, board_id: str) -> list:
+    """Like get_board_ancestry(), but returns display-ready
+    {"label", "board_id"} dicts. The first label is the *project's* name
+    (not the Main Board's own name, in case they've diverged via
+    rename_project) - matches the spec's example "Project Name > Task A"."""
+    ancestry = get_board_ancestry(conn, board_id)
+    if not ancestry:
+        return []
+
+    main_board = ancestry[0]
+    project = get_project(conn, main_board["project_id"])
+    project_name = project["name"] if project else main_board["name"]
+
+    crumbs = [{"label": project_name, "board_id": main_board["id"]}]
+    for board in ancestry[1:]:
+        crumbs.append({"label": board["name"], "board_id": board["id"]})
+    return crumbs
+
+
+def get_board_subtree_ids(conn: sqlite3.Connection, root_board_id: str) -> list:
+    """Every board id in the subtree rooted at root_board_id (itself
+    included), walked breadth-first. This is the one shared "walk this
+    subtree" helper that depth checks, breadcrumb badges, and every
+    cascade-delete confirmation below all build on - iterative rather
+    than recursive since the depth guardrail is a soft warning, not an
+    enforced limit, so a pathological tree could exceed Python's default
+    recursion limit if walked recursively."""
+    result = [root_board_id]
+    frontier = [root_board_id]
+    while frontier:
+        placeholders = ",".join("?" for _ in frontier)
+        rows = conn.execute(
+            f"SELECT pb.id FROM project_boards pb "
+            f"JOIN project_tasks pt ON pb.parent_task_id = pt.id "
+            f"WHERE pt.board_id IN ({placeholders})",
+            frontier,
+        ).fetchall()
+        frontier = [r["id"] for r in rows]
+        result.extend(frontier)
+    return result
+
+
+def get_subtree_counts(conn: sqlite3.Connection, root_board_id: str) -> dict:
+    """Used by cascade-delete confirmations to state how much a delete
+    would take out: every board (root included) and every task across
+    that whole subtree."""
+    board_ids = get_board_subtree_ids(conn, root_board_id)
+    placeholders = ",".join("?" for _ in board_ids)
+    task_count = conn.execute(
+        f"SELECT COUNT(*) AS c FROM project_tasks WHERE board_id IN ({placeholders})", board_ids
+    ).fetchone()["c"]
+    return {"board_count": len(board_ids), "task_count": task_count}
+
+
+def get_subtree_task_progress(conn: sqlite3.Connection, root_board_id: str) -> tuple:
+    """(done, total) task counts across a board's whole subtree - powers
+    the recursive "this task's sub-board is N/M done" badge."""
+    board_ids = get_board_subtree_ids(conn, root_board_id)
+    placeholders = ",".join("?" for _ in board_ids)
+    total = conn.execute(
+        f"SELECT COUNT(*) AS c FROM project_tasks WHERE board_id IN ({placeholders})", board_ids
+    ).fetchone()["c"]
+    done = conn.execute(
+        f"SELECT COUNT(*) AS c FROM project_tasks WHERE board_id IN ({placeholders}) AND completed = 1",
+        board_ids,
+    ).fetchone()["c"]
+    return done, total
+
+
+def delete_project_board(conn: sqlite3.Connection, board_id: str) -> None:
+    """Deletes a board along with its columns/tasks/subtasks, and
+    (recursively, via get_board_subtree_ids) any sub-boards spawned from
+    tasks on it. project_activity_log entries are NOT part of this
+    cascade - see the docstring on delete_project() above."""
+    board_ids = get_board_subtree_ids(conn, board_id)
+    placeholders = ",".join("?" for _ in board_ids)
+
+    conn.execute(
+        f"DELETE FROM project_subtasks WHERE task_id IN "
+        f"(SELECT id FROM project_tasks WHERE board_id IN ({placeholders}))",
+        board_ids,
+    )
+    conn.execute(f"DELETE FROM project_tasks WHERE board_id IN ({placeholders})", board_ids)
+    conn.execute(f"DELETE FROM project_columns WHERE board_id IN ({placeholders})", board_ids)
+    conn.execute(f"DELETE FROM project_boards WHERE id IN ({placeholders})", board_ids)
+    conn.commit()
+
+
+# -- Project columns (always scoped to a project board) ------------------
+
+def get_project_columns(conn: sqlite3.Connection, board_id: str) -> list:
+    rows = conn.execute(
+        "SELECT * FROM project_columns WHERE board_id = ? ORDER BY position ASC", (board_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_project_column(conn: sqlite3.Connection, column_id: str):
+    row = conn.execute("SELECT * FROM project_columns WHERE id = ?", (column_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def get_default_new_project_task_column(conn: sqlite3.Connection, board_id: str):
+    columns = get_project_columns(conn, board_id)
+    return columns[0]["id"] if columns else None
+
+
+def add_project_column(conn: sqlite3.Connection, board_id: str, name: str) -> dict:
+    name = name.strip()
+    if not name:
+        raise ValueError("Column name cannot be empty.")
+
+    max_position_row = conn.execute(
+        "SELECT MAX(position) AS m FROM project_columns WHERE board_id = ?", (board_id,)
+    ).fetchone()
+    next_position = (max_position_row["m"] + 1) if max_position_row["m"] is not None else 0
+
+    column_id = uuid.uuid4().hex
+    conn.execute(
+        "INSERT INTO project_columns (id, board_id, name, position) VALUES (?, ?, ?, ?)",
+        (column_id, board_id, name, next_position),
+    )
+    conn.commit()
+    return get_project_column(conn, column_id)
+
+
+def rename_project_column(conn: sqlite3.Connection, column_id: str, new_name: str) -> None:
+    new_name = new_name.strip()
+    if not new_name:
+        raise ValueError("Column name cannot be empty.")
+    conn.execute("UPDATE project_columns SET name = ? WHERE id = ?", (new_name, column_id))
+    conn.commit()
+
+
+def _compact_project_column_positions(conn: sqlite3.Connection, board_id: str) -> None:
+    for position, col in enumerate(get_project_columns(conn, board_id)):
+        if col["position"] != position:
+            conn.execute("UPDATE project_columns SET position = ? WHERE id = ?", (position, col["id"]))
+    conn.commit()
+
+
+def delete_project_column(conn: sqlite3.Connection, board_id: str, column_id: str) -> None:
+    columns = get_project_columns(conn, board_id)
+    if len(columns) <= 1:
+        raise ValueError("At least one column must remain on this board.")
+
+    task_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM project_tasks WHERE board_id = ? AND column_id = ?",
+        (board_id, column_id),
+    ).fetchone()["c"]
+    if task_count > 0:
+        raise ValueError(
+            f"This column still has {task_count} task(s) in it. "
+            "Move or delete them first, then delete the column."
+        )
+
+    conn.execute("DELETE FROM project_columns WHERE id = ?", (column_id,))
+    conn.commit()
+    _compact_project_column_positions(conn, board_id)
+
+
+def move_project_column(conn: sqlite3.Connection, board_id: str, column_id: str, direction: int) -> None:
+    columns = get_project_columns(conn, board_id)
+    ids = [c["id"] for c in columns]
+    if column_id not in ids:
+        return
+
+    idx = ids.index(column_id)
+    new_idx = idx + direction
+    if new_idx < 0 or new_idx >= len(columns):
+        return
+
+    columns[idx], columns[new_idx] = columns[new_idx], columns[idx]
+    for position, col in enumerate(columns):
+        conn.execute("UPDATE project_columns SET position = ? WHERE id = ?", (position, col["id"]))
+    conn.commit()
+
+
+# -- Project tasks (fixed to the board they were created on) -------------
+
+def add_project_task(
+    conn: sqlite3.Connection, board_id: str, column_id: str, title: str,
+    notes: str = "", start_date: str = "", due_date: str = "", link: str = "",
+) -> dict:
+    title = title.strip()
+    if not title:
+        raise ValueError("Task title cannot be empty.")
+
+    max_position_row = conn.execute(
+        "SELECT MAX(position) AS m FROM project_tasks WHERE board_id = ? AND column_id = ?",
+        (board_id, column_id),
+    ).fetchone()
+    next_position = (max_position_row["m"] + 1) if max_position_row["m"] is not None else 0
+
+    task_id = uuid.uuid4().hex
+    conn.execute(
+        "INSERT INTO project_tasks "
+        "(id, board_id, column_id, title, notes, start_date, due_date, completed, position, link, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+        (task_id, board_id, column_id, title, notes, start_date or None, due_date or None,
+         next_position, link, _now()),
+    )
+    conn.commit()
+    return get_project_task(conn, task_id)
+
+
+def get_project_task(conn: sqlite3.Connection, task_id: str):
+    row = conn.execute("SELECT * FROM project_tasks WHERE id = ?", (task_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def get_project_tasks_for_column(conn: sqlite3.Connection, board_id: str, column_id: str) -> list:
+    rows = conn.execute(
+        "SELECT * FROM project_tasks WHERE board_id = ? AND column_id = ? ORDER BY position ASC",
+        (board_id, column_id),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_project_tasks_for_board(conn: sqlite3.Connection, board_id: str) -> list:
+    """Flat, all columns - used by the List view."""
+    rows = conn.execute(
+        "SELECT * FROM project_tasks WHERE board_id = ? ORDER BY position ASC", (board_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_missing_dates_tasks(conn: sqlite3.Connection, board_id: str) -> list:
+    rows = conn.execute(
+        "SELECT * FROM project_tasks WHERE board_id = ? "
+        "AND (start_date IS NULL OR start_date = '' OR due_date IS NULL OR due_date = '') "
+        "ORDER BY position ASC",
+        (board_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_project_task(
+    conn: sqlite3.Connection, task_id: str, title: str, notes: str,
+    start_date: str, due_date: str, link: str,
+) -> None:
+    title = title.strip()
+    if not title:
+        raise ValueError("Task title cannot be empty.")
+    conn.execute(
+        "UPDATE project_tasks SET title = ?, notes = ?, start_date = ?, due_date = ?, link = ? WHERE id = ?",
+        (title, notes, start_date or None, due_date or None, link, task_id),
+    )
+    conn.commit()
+
+
+def set_project_task_completed(conn: sqlite3.Connection, task_id: str, completed: bool) -> None:
+    conn.execute(
+        "UPDATE project_tasks SET completed = ? WHERE id = ?", (1 if completed else 0, task_id)
+    )
+    conn.commit()
+
+
+def move_project_task(conn: sqlite3.Connection, task_id: str, new_column_id: str) -> None:
+    task = get_project_task(conn, task_id)
+    if task is None:
+        return
+    max_position_row = conn.execute(
+        "SELECT MAX(position) AS m FROM project_tasks WHERE board_id = ? AND column_id = ?",
+        (task["board_id"], new_column_id),
+    ).fetchone()
+    next_position = (max_position_row["m"] + 1) if max_position_row["m"] is not None else 0
+    conn.execute(
+        "UPDATE project_tasks SET column_id = ?, position = ? WHERE id = ?",
+        (new_column_id, next_position, task_id),
+    )
+    conn.commit()
+
+
+def delete_project_task(conn: sqlite3.Connection, task_id: str) -> None:
+    """If this task owns a sub-board, that whole subtree is deleted first
+    (see delete_project_board). Callers that want to confirm this with the
+    user first should check get_subboard_for_task() before calling this -
+    see ProjectsHub.confirm_and_delete_task()."""
+    subboard = get_subboard_for_task(conn, task_id)
+    if subboard is not None:
+        delete_project_board(conn, subboard["id"])
+    conn.execute("DELETE FROM project_subtasks WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM project_tasks WHERE id = ?", (task_id,))
+    conn.commit()
+
+
+# -- Project subtasks (checklist items on a single project task) ---------
+
+def get_project_subtasks(conn: sqlite3.Connection, task_id: str) -> list:
+    rows = conn.execute(
+        "SELECT * FROM project_subtasks WHERE task_id = ? ORDER BY position ASC", (task_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_project_subtask(conn: sqlite3.Connection, task_id: str, title: str) -> dict:
+    title = title.strip()
+    if not title:
+        raise ValueError("Subtask title cannot be empty.")
+
+    max_position_row = conn.execute(
+        "SELECT MAX(position) AS m FROM project_subtasks WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    next_position = (max_position_row["m"] + 1) if max_position_row["m"] is not None else 0
+
+    subtask_id = uuid.uuid4().hex
+    conn.execute(
+        "INSERT INTO project_subtasks (id, task_id, title, done, position) VALUES (?, ?, ?, 0, ?)",
+        (subtask_id, task_id, title, next_position),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM project_subtasks WHERE id = ?", (subtask_id,)).fetchone()
+    return dict(row)
+
+
+def set_project_subtask_done(conn: sqlite3.Connection, subtask_id: str, done: bool) -> None:
+    conn.execute("UPDATE project_subtasks SET done = ? WHERE id = ?", (1 if done else 0, subtask_id))
+    conn.commit()
+
+
+def delete_project_subtask(conn: sqlite3.Connection, subtask_id: str) -> None:
+    conn.execute("DELETE FROM project_subtasks WHERE id = ?", (subtask_id,))
+    conn.commit()
+
+
+def get_project_task_count(conn: sqlite3.Connection, project_id: str) -> int:
+    """Total tasks across a whole project's board tree - used by the
+    delete-project confirmation, mirroring get_board_task_count()."""
+    project = get_project(conn, project_id)
+    if project is None or not project.get("main_board_id"):
+        return 0
+    return get_subtree_counts(conn, project["main_board_id"])["task_count"]
 
 
 # ---------------------------------------------------------------------------
@@ -2713,7 +3337,16 @@ class TaskListWidget(QListWidget):
     the SAME board (columns belonging to a different board are never shown
     at the same time, but this guards against any stray drag anyway), and
     asks the board to persist the move rather than letting Qt shuffle items
-    around on its own."""
+    around on its own.
+
+    Reused as-is by both the Boards feature (KanbanBoard) and the Projects
+    feature (ProjectKanbanWidget) - each "board" controller sets a
+    BOARD_KIND class attribute ("boards"/"projects"), and _same_kind()
+    below refuses drops across that boundary. Nothing about that crossing
+    can normally happen (the two features are never both visible at once,
+    since main() only ever shows one page of its QStackedWidget), but the
+    check is cheap and directly serves the Projects issue's isolation
+    requirement, so it's here as defense in depth."""
 
     def __init__(self, status, board, parent=None):
         super().__init__(parent)
@@ -2746,23 +3379,30 @@ class TaskListWidget(QListWidget):
         task_id = item.data(Qt.UserRole)
         self.board.show_move_task_menu(task_id, self.status, self.mapToGlobal(pos))
 
+    def _same_kind(self, source) -> bool:
+        return (
+            isinstance(source, TaskListWidget)
+            and source is not self
+            and getattr(source.board, "BOARD_KIND", None) == getattr(self.board, "BOARD_KIND", None)
+        )
+
     def dragEnterEvent(self, event):
         source = event.source()
-        if isinstance(source, TaskListWidget) and source is not self:
+        if self._same_kind(source):
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dragMoveEvent(self, event):
         source = event.source()
-        if isinstance(source, TaskListWidget) and source is not self:
+        if self._same_kind(source):
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dropEvent(self, event):
         source = event.source()
-        if not isinstance(source, TaskListWidget) or source is self:
+        if not self._same_kind(source):
             event.ignore()
             return
 
@@ -2904,13 +3544,14 @@ class BoardSidePanel(QWidget):
         )
         layout.addWidget(projects_label)
 
-        no_projects_label = QLabel("No projects yet")
-        no_projects_label.setStyleSheet("color: #6e6e6e; padding: 4px 16px;")
-        layout.addWidget(no_projects_label)
+        self.projects_list_layout = QVBoxLayout()
+        self.projects_list_layout.setContentsMargins(0, 0, 0, 0)
+        self.projects_list_layout.setSpacing(0)
+        layout.addLayout(self.projects_list_layout)
 
         layout.addStretch()
 
-    def refresh(self, boards, current_board_id) -> None:
+    def refresh(self, boards, current_board_id, projects) -> None:
         while self.boards_list_layout.count():
             item = self.boards_list_layout.takeAt(0)
             widget = item.widget()
@@ -2988,8 +3629,96 @@ class BoardSidePanel(QWidget):
         add_board_btn.clicked.connect(self.board.add_board_ui)
         self.boards_list_layout.addWidget(add_board_btn)
 
+        self._refresh_projects(projects)
+
+    def _refresh_projects(self, projects) -> None:
+        """Same row styling as the boards list above, but there's no
+        "current project" concept to highlight - selecting a project
+        switches the whole app view (Boards <-> Projects) rather than
+        selecting within this panel like a board does."""
+        while self.projects_list_layout.count():
+            item = self.projects_list_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        flat_btn_qss = (
+            "QPushButton {{ background: transparent; border: none; {extra} }}"
+            "QPushButton:hover {{ background: transparent; {hover_extra} }}"
+            "QPushButton:pressed {{ background: transparent; }}"
+        )
+
+        for p in projects:
+            row_widget = QWidget()
+            row_widget.setObjectName("projectRow")
+            row_widget.setAttribute(Qt.WA_StyledBackground, True)
+            row_widget.setStyleSheet(
+                "QWidget#projectRow { background-color: transparent; border-radius: 8px; }"
+                "QWidget#projectRow:hover { background-color: #2c2e33; }"
+            )
+            row = QHBoxLayout(row_widget)
+            row.setContentsMargins(4, 2, 4, 2)
+            row.setSpacing(0)
+
+            select_btn = QPushButton("     " + p["name"])
+            select_btn.setFlat(True)
+            select_btn.setStyleSheet(
+                flat_btn_qss.format(
+                    extra="text-align: left; padding: 8px 4px 8px 12px; color: #e8e8e8;",
+                    hover_extra="",
+                )
+            )
+            select_btn.clicked.connect(
+                lambda checked=False, project_id=p["id"]: self.board.select_project_from_panel(project_id)
+            )
+            row.addWidget(select_btn, stretch=1)
+
+            edit_btn = QPushButton("⋮")
+            edit_btn.setFixedWidth(24)
+            edit_btn.setStyleSheet(
+                flat_btn_qss.format(extra="color: #9a9a9a;", hover_extra="color: #e8e8e8;")
+            )
+            edit_btn.setToolTip("Edit project")
+
+            def make_menu(checked=False, project_id=p["id"], anchor_btn=edit_btn):
+                menu = QMenu(anchor_btn)
+                move_up = menu.addAction("Move Up")
+                move_down = menu.addAction("Move Down")
+                rename = menu.addAction("Rename")
+                menu.addSeparator()
+                delete = menu.addAction("Delete")
+
+                move_up.triggered.connect(lambda: self.board.move_project_ui(project_id, -1))
+                move_down.triggered.connect(lambda: self.board.move_project_ui(project_id, 1))
+                rename.triggered.connect(lambda: self.board.rename_project_ui(project_id))
+                delete.triggered.connect(lambda: self.board.delete_project_ui(project_id))
+
+                menu.exec(anchor_btn.mapToGlobal(anchor_btn.rect().bottomLeft()))
+
+            edit_btn.clicked.connect(make_menu)
+            row.addWidget(edit_btn)
+
+            self.projects_list_layout.addWidget(row_widget)
+
+        if not projects:
+            empty = QLabel("No projects yet")
+            empty.setStyleSheet("color: #6e6e6e; padding: 4px 16px;")
+            self.projects_list_layout.addWidget(empty)
+
+        add_project_btn = QPushButton("+ Add Project")
+        add_project_btn.setFlat(True)
+        add_project_btn.setStyleSheet("text-align: left; padding: 8px 16px; color: #8b93ff; border: none;")
+        add_project_btn.clicked.connect(self.board.add_project_ui)
+        self.projects_list_layout.addWidget(add_project_btn)
+
 
 class KanbanBoard(QWidget):
+    # Used by TaskListWidget's drag-and-drop guard to keep Boards and
+    # Projects cards from being dragged into each other's columns, even
+    # though both features reuse the same ColumnWidget/TaskListWidget
+    # classes - see ProjectKanbanWidget.BOARD_KIND.
+    BOARD_KIND = "boards"
+
     def __init__(self, conn, parent=None):
         super().__init__(parent)
         self.conn = conn
@@ -3000,6 +3729,8 @@ class KanbanBoard(QWidget):
         self._board_panel_anim = None
         self._quick_add_dialog = None
         self.show_completed = False
+        self._projects_cache = get_projects(self.conn)
+        self._open_project_callback = None
 
         outer = QVBoxLayout(self)
 
@@ -3092,7 +3823,8 @@ class KanbanBoard(QWidget):
             self.open_board_panel()
 
     def open_board_panel(self) -> None:
-        self.board_panel.refresh(self._boards_cache, self.current_board_id)
+        self.rebuild_projects_cache()
+        self.board_panel.refresh(self._boards_cache, self.current_board_id, self._projects_cache)
 
         panel_width = BoardSidePanel.PANEL_WIDTH
 
@@ -3132,6 +3864,18 @@ class KanbanBoard(QWidget):
 
     def select_board_from_panel(self, board_id: str) -> None:
         self._select_board(board_id)
+        self.close_board_panel()
+
+    # -- Projects entry point (kept decoupled from ProjectsHub itself -
+    # the callback is injected by main(), so KanbanBoard never has to
+    # import or know about Projects UI classes) -------------------------
+
+    def set_open_project_callback(self, callback) -> None:
+        self._open_project_callback = callback
+
+    def select_project_from_panel(self, project_id: str) -> None:
+        if self._open_project_callback is not None:
+            self._open_project_callback(project_id)
         self.close_board_panel()
 
     # -- column-status helpers used by ColumnWidget --------------------
@@ -3454,7 +4198,7 @@ class KanbanBoard(QWidget):
     # -- board operations ------------------------------------------------
 
     def _sync_board_panel(self) -> None:
-        self.board_panel.refresh(self._boards_cache, self.current_board_id)
+        self.board_panel.refresh(self._boards_cache, self.current_board_id, self._projects_cache)
 
     def add_board_ui(self) -> None:
         name, ok = QInputDialog.getText(self, "New Board", "Board name:")
@@ -3507,6 +4251,63 @@ class KanbanBoard(QWidget):
         self.rebuild_boards_selector(preferred_board_id=self.current_board_id)
         self._sync_board_panel()
 
+    # -- project operations (Projects side-panel section) ----------------
+    # Mirrors the board operations above 1:1 against the project_*
+    # data layer - the only difference is that "selecting" a project
+    # switches the whole app view (see select_project_from_panel) rather
+    # than swapping content within this same widget.
+
+    def rebuild_projects_cache(self) -> None:
+        self._projects_cache = get_projects(self.conn)
+
+    def add_project_ui(self) -> None:
+        name, ok = QInputDialog.getText(self, "New Project", "Project name:")
+        if not ok or not name.strip():
+            return
+        try:
+            project = add_project(self.conn, name.strip())
+        except ValueError as e:
+            QMessageBox.warning(self, "Could not add project", str(e))
+            return
+        self.rebuild_projects_cache()
+        self._sync_board_panel()
+        self.select_project_from_panel(project["id"])
+
+    def rename_project_ui(self, project_id: str) -> None:
+        project = get_project(self.conn, project_id)
+        if not project:
+            return
+        name, ok = QInputDialog.getText(self, "Rename Project", "Project name:", text=project["name"])
+        if not ok or not name.strip():
+            return
+        try:
+            rename_project(self.conn, project_id, name.strip())
+        except ValueError as e:
+            QMessageBox.warning(self, "Could not rename project", str(e))
+            return
+        self.rebuild_projects_cache()
+        self._sync_board_panel()
+
+    def delete_project_ui(self, project_id: str) -> None:
+        project = get_project(self.conn, project_id)
+        if not project:
+            return
+        task_count = get_project_task_count(self.conn, project_id)
+        message = f'Delete the project "{project["name"]}"? This deletes its Main Board and every sub-board below it.'
+        if task_count:
+            message += f" This will permanently delete {task_count} task(s) across all of its boards."
+        reply = QMessageBox.question(self, "Delete project", message, QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        delete_project(self.conn, project_id)
+        self.rebuild_projects_cache()
+        self._sync_board_panel()
+
+    def move_project_ui(self, project_id: str, direction: int) -> None:
+        move_project(self.conn, project_id, direction)
+        self.rebuild_projects_cache()
+        self._sync_board_panel()
+
     # -- global quick-add shortcut (Ctrl+Space) ---------------------------
 
     def show_quick_add_dialog(self) -> None:
@@ -3536,6 +4337,926 @@ class KanbanBoard(QWidget):
 
         if self.current_board_id in dialog.added_board_ids:
             self.refresh()
+
+
+# ---------------------------------------------------------------------------
+# Projects UI. Everything below is new, and self-contained: it only reaches
+# into the code above for the generic app scaffolding this file already
+# shares everywhere (Qt widgets, APP_STYLESHEET, ColumnWidget/TaskListWidget
+# reused via duck-typing - see ProjectKanbanWidget). No class here holds a
+# reference to KanbanBoard or any of its state, and vice versa.
+# ---------------------------------------------------------------------------
+
+class BreadcrumbBar(QWidget):
+    """The "Project Name > Task A > Task A.2" navigation strip at the top
+    of a Projects board view. Truncates the middle into a "..." popup menu
+    (rather than just eliding text) when the full path doesn't fit, so
+    every ancestor board stays reachable even when collapsed."""
+
+    crumb_clicked = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._crumbs = []
+        self._row = QHBoxLayout(self)
+        self._row.setContentsMargins(0, 0, 0, 0)
+        self._row.setSpacing(2)
+
+    def set_crumbs(self, crumbs: list) -> None:
+        self._crumbs = crumbs
+        self._rebuild()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        while self._row.count():
+            item = self._row.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        crumbs = self._crumbs
+        if not crumbs:
+            return
+
+        metrics = self.fontMetrics()
+        CHROME_PER_CRUMB = 40  # rough padding/separator allowance per segment
+        total_width = sum(metrics.horizontalAdvance(c["label"]) + CHROME_PER_CRUMB for c in crumbs)
+
+        display = crumbs
+        hidden = []
+        if total_width > max(self.width(), 1) and len(crumbs) > 2:
+            hidden = crumbs[1:-1]
+            display = [crumbs[0], None, crumbs[-1]]
+
+        current = crumbs[-1]
+        for node in display:
+            if node is None:
+                ellipsis_btn = QToolButton()
+                ellipsis_btn.setText("…")
+                ellipsis_btn.setAutoRaise(True)
+                ellipsis_btn.setStyleSheet(
+                    "QToolButton { color: #8a8a8a; border: none; background: transparent; }"
+                )
+                menu = QMenu(ellipsis_btn)
+                for hidden_crumb in hidden:
+                    action = menu.addAction(hidden_crumb["label"])
+                    action.triggered.connect(
+                        lambda checked=False, bid=hidden_crumb["board_id"]: self.crumb_clicked.emit(bid)
+                    )
+                ellipsis_btn.setMenu(menu)
+                ellipsis_btn.setPopupMode(QToolButton.InstantPopup)
+                self._row.addWidget(ellipsis_btn)
+                self._add_separator()
+                continue
+
+            is_current = node is current
+            btn = QPushButton(node["label"])
+            btn.setFlat(True)
+            if is_current:
+                btn.setEnabled(False)
+                btn.setStyleSheet(
+                    "QPushButton { font-weight: bold; color: #e8e8e8; border: none; "
+                    "background: transparent; text-align: left; padding: 2px; }"
+                )
+            else:
+                btn.setStyleSheet(
+                    "QPushButton { color: #8b93ff; border: none; background: transparent; "
+                    "text-align: left; padding: 2px; }"
+                )
+                btn.clicked.connect(lambda checked=False, bid=node["board_id"]: self.crumb_clicked.emit(bid))
+            self._row.addWidget(btn)
+            if not is_current:
+                self._add_separator()
+
+        self._row.addStretch()
+
+    def _add_separator(self) -> None:
+        sep = QLabel("›")
+        sep.setStyleSheet("color: #6e6e6e; padding: 0 2px;")
+        self._row.addWidget(sep)
+
+
+class NewProjectTaskDialog(QDialog):
+    """Task-creation dialog for a Projects board - same shape as
+    NewTaskDialog, plus a second date (start_date, for the Gantt/Calendar
+    views a later phase adds) and "link" instead of "joplin_link"."""
+
+    def __init__(self, columns: list, default_column_id, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("New Task")
+        self.resize(420, 460)
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("Title"))
+        self.title_edit = QLineEdit()
+        layout.addWidget(self.title_edit)
+
+        layout.addWidget(QLabel("Column"))
+        self.column_combo = QComboBox()
+        for col in columns:
+            self.column_combo.addItem(col["name"], col["id"])
+        default_idx = next((i for i, c in enumerate(columns) if c["id"] == default_column_id), 0)
+        self.column_combo.setCurrentIndex(default_idx)
+        layout.addWidget(self.column_combo)
+
+        layout.addWidget(QLabel("Start Date"))
+        self.start_date_check, self.start_date_edit = self._build_date_row(layout)
+
+        layout.addWidget(QLabel("Due Date"))
+        self.due_date_check, self.due_date_edit = self._build_date_row(layout)
+
+        layout.addWidget(QLabel("Link"))
+        self.link_edit = QLineEdit()
+        self.link_edit.setPlaceholderText("https://...")
+        layout.addWidget(self.link_edit)
+
+        layout.addWidget(QLabel("Notes"))
+        self.notes_edit = QTextEdit()
+        layout.addWidget(self.notes_edit, stretch=1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        add_btn = QPushButton("Add Task")
+        add_btn.setProperty("accent", True)
+        add_btn.setDefault(True)
+        add_btn.clicked.connect(self._on_add)
+        btn_row.addWidget(add_btn)
+        layout.addLayout(btn_row)
+
+        self.title_edit.setFocus()
+
+    @staticmethod
+    def _build_date_row(layout):
+        row = QHBoxLayout()
+        check = QCheckBox("Set")
+        row.addWidget(check)
+        edit = QDateEdit()
+        edit.setCalendarPopup(True)
+        edit.setDisplayFormat("yyyy-MM-dd")
+        edit.setDate(QDate.currentDate())
+        edit.setEnabled(False)
+        check.toggled.connect(edit.setEnabled)
+        row.addWidget(edit, stretch=1)
+        layout.addLayout(row)
+        return check, edit
+
+    def _on_add(self) -> None:
+        if not self.title_edit.text().strip():
+            QMessageBox.warning(self, "Title required", "Task title cannot be empty.")
+            return
+        self.accept()
+
+    def result_values(self) -> dict:
+        return {
+            "title": self.title_edit.text().strip(),
+            "notes": self.notes_edit.toPlainText().strip(),
+            "column_id": self.column_combo.currentData(),
+            "start_date": self.start_date_edit.date().toString("yyyy-MM-dd") if self.start_date_check.isChecked() else "",
+            "due_date": self.due_date_edit.date().toString("yyyy-MM-dd") if self.due_date_check.isChecked() else "",
+            "link": self.link_edit.text().strip(),
+        }
+
+
+class ProjectTaskCardDialog(QDialog):
+    """Full card view for a Projects task - same shape/rationale as
+    TaskCardDialog (subtasks write straight through, everything else only
+    applied on Save), plus a start date and a Create/Open Sub-board
+    action. That action sets subboard_action_requested and accepts the
+    dialog (not a separate reject path) so any field edits made before
+    clicking it are still saved by the caller."""
+
+    def __init__(self, conn: sqlite3.Connection, task: dict, columns: list, subboard, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.task_id = task["id"]
+        self.setWindowTitle(task["title"])
+        self.resize(440, 700)
+        self.delete_requested = False
+        self.subboard_action_requested = False
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("Title"))
+        self.title_edit = QLineEdit(task["title"])
+        layout.addWidget(self.title_edit)
+
+        layout.addWidget(QLabel("Column"))
+        self.column_combo = QComboBox()
+        for col in columns:
+            self.column_combo.addItem(col["name"], col["id"])
+        current_idx = next((i for i, c in enumerate(columns) if c["id"] == task["column_id"]), 0)
+        self.column_combo.setCurrentIndex(current_idx)
+        layout.addWidget(self.column_combo)
+
+        self.completed_check = QCheckBox("Completed")
+        self.completed_check.setChecked(bool(task.get("completed")))
+        layout.addWidget(self.completed_check)
+
+        layout.addWidget(QLabel("Start Date"))
+        self.start_date_check, self.start_date_edit = self._build_date_row(layout, task.get("start_date"))
+
+        layout.addWidget(QLabel("Due Date"))
+        self.due_date_check, self.due_date_edit = self._build_date_row(layout, task.get("due_date"))
+
+        layout.addWidget(QLabel("Link"))
+        self.link_edit = QLineEdit(task.get("link") or "")
+        self.link_edit.setPlaceholderText("https://...")
+        layout.addWidget(self.link_edit)
+
+        layout.addWidget(QLabel("Notes"))
+        self.notes_edit = QTextEdit()
+        self.notes_edit.setPlainText(task.get("notes") or "")
+        layout.addWidget(self.notes_edit, stretch=1)
+
+        layout.addWidget(QLabel("Subtasks"))
+        self.subtasks_list = QListWidget()
+        self.subtasks_list.itemChanged.connect(self._on_subtask_item_changed)
+        layout.addWidget(self.subtasks_list, stretch=1)
+
+        subtask_add_row = QHBoxLayout()
+        self.new_subtask_edit = QLineEdit()
+        self.new_subtask_edit.setPlaceholderText("New subtask...")
+        self.new_subtask_edit.returnPressed.connect(self._add_subtask)
+        subtask_add_row.addWidget(self.new_subtask_edit)
+        add_subtask_btn = QPushButton("Add")
+        add_subtask_btn.clicked.connect(self._add_subtask)
+        subtask_add_row.addWidget(add_subtask_btn)
+        delete_subtask_btn = QPushButton("Delete")
+        delete_subtask_btn.clicked.connect(self._delete_selected_subtask)
+        subtask_add_row.addWidget(delete_subtask_btn)
+        layout.addLayout(subtask_add_row)
+        self._refresh_subtasks()
+
+        subboard_row = QHBoxLayout()
+        if subboard is not None:
+            done, total = get_subtree_task_progress(self.conn, subboard["id"])
+            subboard_btn = QPushButton(f"Open Sub-board (⧉ {done}/{total})")
+        else:
+            subboard_btn = QPushButton("Create Sub-board")
+        subboard_btn.clicked.connect(self._on_subboard_action)
+        subboard_row.addWidget(subboard_btn)
+        layout.addLayout(subboard_row)
+
+        meta_label = QLabel(f"Created {task['created_at']}")
+        meta_label.setStyleSheet("color: #888888; font-size: 11px;")
+        layout.addWidget(meta_label)
+
+        btn_row = QHBoxLayout()
+        delete_btn = QPushButton("Delete")
+        delete_btn.setStyleSheet("color: #b00000;")
+        delete_btn.clicked.connect(self._on_delete)
+        btn_row.addWidget(delete_btn)
+        btn_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        save_btn = QPushButton("Save")
+        save_btn.setProperty("accent", True)
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self._on_save)
+        btn_row.addWidget(save_btn)
+        layout.addLayout(btn_row)
+
+    @staticmethod
+    def _build_date_row(layout, existing_value):
+        row = QHBoxLayout()
+        check = QCheckBox("Set")
+        row.addWidget(check)
+        edit = QDateEdit()
+        edit.setCalendarPopup(True)
+        edit.setDisplayFormat("yyyy-MM-dd")
+        existing = QDate.fromString(existing_value or "", "yyyy-MM-dd")
+        check.setChecked(existing.isValid())
+        edit.setDate(existing if existing.isValid() else QDate.currentDate())
+        edit.setEnabled(existing.isValid())
+        check.toggled.connect(edit.setEnabled)
+        row.addWidget(edit, stretch=1)
+        layout.addLayout(row)
+        return check, edit
+
+    def _on_save(self) -> None:
+        if not self.title_edit.text().strip():
+            QMessageBox.warning(self, "Title required", "Task title cannot be empty.")
+            return
+        self.accept()
+
+    def _on_delete(self) -> None:
+        self.delete_requested = True
+        self.reject()
+
+    def _on_subboard_action(self) -> None:
+        if not self.title_edit.text().strip():
+            QMessageBox.warning(self, "Title required", "Task title cannot be empty.")
+            return
+        self.subboard_action_requested = True
+        self.accept()
+
+    # -- subtasks (write straight to the database, same rationale as
+    # TaskCardDialog's own subtask handling) -----------------------------
+
+    def _refresh_subtasks(self) -> None:
+        self.subtasks_list.blockSignals(True)
+        self.subtasks_list.clear()
+        for sub in get_project_subtasks(self.conn, self.task_id):
+            item = QListWidgetItem(sub["title"])
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if sub["done"] else Qt.Unchecked)
+            item.setData(Qt.UserRole, sub["id"])
+            self.subtasks_list.addItem(item)
+        self.subtasks_list.blockSignals(False)
+
+    def _on_subtask_item_changed(self, item: QListWidgetItem) -> None:
+        set_project_subtask_done(self.conn, item.data(Qt.UserRole), item.checkState() == Qt.Checked)
+
+    def _add_subtask(self) -> None:
+        title = self.new_subtask_edit.text().strip()
+        if not title:
+            return
+        add_project_subtask(self.conn, self.task_id, title)
+        self.new_subtask_edit.clear()
+        self._refresh_subtasks()
+
+    def _delete_selected_subtask(self) -> None:
+        item = self.subtasks_list.currentItem()
+        if item is None:
+            return
+        delete_project_subtask(self.conn, item.data(Qt.UserRole))
+        self._refresh_subtasks()
+
+    def result_values(self) -> dict:
+        return {
+            "title": self.title_edit.text().strip(),
+            "notes": self.notes_edit.toPlainText().strip(),
+            "column_id": self.column_combo.currentData(),
+            "start_date": self.start_date_edit.date().toString("yyyy-MM-dd") if self.start_date_check.isChecked() else "",
+            "due_date": self.due_date_edit.date().toString("yyyy-MM-dd") if self.due_date_check.isChecked() else "",
+            "link": self.link_edit.text().strip(),
+            "completed": self.completed_check.isChecked(),
+        }
+
+
+class ProjectKanbanWidget(QWidget):
+    """The Kanban page of a Projects board view. Reuses ColumnWidget and
+    TaskListWidget unmodified (see their docstrings above) by duck-typing
+    the callback methods they expect on "board", fed project_columns rows
+    reshaped as {"status": column_id, "name": ...} - status here is just
+    an opaque identity, not a real slug."""
+
+    # See KanbanBoard.BOARD_KIND.
+    BOARD_KIND = "projects"
+
+    def __init__(self, conn: sqlite3.Connection, hub, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.hub = hub
+        self.board_id = None
+        self.columns = {}          # project_column id -> ColumnWidget
+        self._columns_cache = []
+        self._edit_mode = False
+        self.show_completed = False
+
+        self.columns_layout = QHBoxLayout(self)
+        self.columns_layout.setSpacing(12)
+
+    # -- board load / structural rebuild ---------------------------------
+
+    def load_board(self, board_id: str) -> None:
+        self.board_id = board_id
+        self.rebuild_columns()
+
+    def rebuild_columns(self) -> None:
+        while self.columns_layout.count():
+            item = self.columns_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        self.columns = {}
+        self._columns_cache = get_project_columns(self.conn, self.board_id) if self.board_id else []
+        for col in self._columns_cache:
+            adapted = {"status": col["id"], "name": col["name"]}
+            widget = ColumnWidget(adapted, self)
+            widget.set_edit_controls_visible(self._edit_mode)
+            self.columns[col["id"]] = widget
+            self.columns_layout.addWidget(widget)
+
+        self.refresh()
+
+    def set_edit_mode(self, enabled: bool) -> None:
+        self._edit_mode = enabled
+        for widget in self.columns.values():
+            widget.set_edit_controls_visible(enabled)
+
+    def set_show_completed(self, enabled: bool) -> None:
+        self.show_completed = enabled
+        self.refresh()
+
+    # -- lightweight refresh (task list contents only) -------------------
+
+    def refresh(self) -> None:
+        for column_id, col_widget in self.columns.items():
+            list_widget = col_widget.list_widget
+            list_widget.blockSignals(True)
+            list_widget.clear()
+
+            all_tasks = get_project_tasks_for_column(self.conn, self.board_id, column_id)
+            tasks = all_tasks if self.show_completed else [t for t in all_tasks if not t["completed"]]
+
+            for task in tasks:
+                item = QListWidgetItem(self._task_card_text(task))
+                item.setData(Qt.UserRole, task["id"])
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked if task["completed"] else Qt.Unchecked)
+                if task["completed"]:
+                    font = item.font()
+                    font.setStrikeOut(True)
+                    item.setFont(font)
+                    item.setForeground(QColor("#767676"))
+                list_widget.addItem(item)
+
+            list_widget.blockSignals(False)
+            col_widget.set_count(len(tasks))
+
+    def _task_card_text(self, task: dict) -> str:
+        meta_parts = []
+        if task.get("start_date") and task.get("due_date"):
+            meta_parts.append(f"{task['start_date']} → {task['due_date']}")
+        elif task.get("due_date"):
+            meta_parts.append(f"Due {task['due_date']}")
+        elif task.get("start_date"):
+            meta_parts.append(f"Starts {task['start_date']}")
+        else:
+            meta_parts.append("◇ no dates set")
+
+        subtasks = get_project_subtasks(self.conn, task["id"])
+        if subtasks:
+            done_count = sum(1 for s in subtasks if s["done"])
+            meta_parts.append(f"{done_count}/{len(subtasks)} done")
+
+        subboard = get_subboard_for_task(self.conn, task["id"])
+        if subboard is not None:
+            done, total = get_subtree_task_progress(self.conn, subboard["id"])
+            meta_parts.append(f"⧉ {done}/{total}")
+
+        if task.get("link"):
+            meta_parts.append("Link")
+
+        text = task["title"]
+        if meta_parts:
+            text += "\n" + "   ".join(meta_parts)
+        return text
+
+    # -- task operations (called by ColumnWidget/TaskListWidget) ---------
+
+    def add_task(self, target_status=None) -> None:
+        if not self._columns_cache:
+            QMessageBox.information(self, "No columns", "Add a column first.")
+            return
+        default_column_id = target_status or get_default_new_project_task_column(self.conn, self.board_id)
+        dialog = NewProjectTaskDialog(self._columns_cache, default_column_id, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        values = dialog.result_values()
+        add_project_task(
+            self.conn, self.board_id, values["column_id"], values["title"], values["notes"],
+            values["start_date"], values["due_date"], values["link"],
+        )
+        self.hub.refresh_all_views()
+
+    def edit_task(self, task_id: str) -> None:
+        task = get_project_task(self.conn, task_id)
+        if not task:
+            return
+
+        subboard = get_subboard_for_task(self.conn, task_id)
+        dialog = ProjectTaskCardDialog(self.conn, task, self._columns_cache, subboard, self)
+        result = dialog.exec()
+
+        if dialog.delete_requested:
+            self.hub.confirm_and_delete_task(task_id)
+            return
+
+        if result != QDialog.Accepted:
+            return
+
+        values = dialog.result_values()
+        update_project_task(
+            self.conn, task_id, values["title"], values["notes"],
+            values["start_date"], values["due_date"], values["link"],
+        )
+        if values["column_id"] and values["column_id"] != task["column_id"]:
+            move_project_task(self.conn, task_id, values["column_id"])
+        if values["completed"] != bool(task["completed"]):
+            set_project_task_completed(self.conn, task_id, values["completed"])
+
+        if dialog.subboard_action_requested:
+            self.hub.open_or_create_subboard(task_id)
+            return
+
+        self.hub.refresh_all_views()
+
+    def handle_move(self, task_id: str, new_column_id: str) -> None:
+        task = get_project_task(self.conn, task_id)
+        if not task or task["column_id"] == new_column_id:
+            return
+        move_project_task(self.conn, task_id, new_column_id)
+        self.hub.refresh_all_views()
+
+    def handle_set_completed(self, task_id: str, completed: bool) -> None:
+        set_project_task_completed(self.conn, task_id, completed)
+        # Deferred for the same reason as KanbanBoard.handle_set_completed:
+        # this fires from inside the card's own checkbox-toggle signal, and
+        # refresh() rebuilds (clears) that same list widget.
+        QTimer.singleShot(0, self.hub.refresh_all_views)
+
+    def show_move_task_menu(self, task_id: str, current_column_id: str, global_pos) -> None:
+        menu = QMenu(self)
+
+        subboard = get_subboard_for_task(self.conn, task_id)
+        if subboard is not None:
+            done, total = get_subtree_task_progress(self.conn, subboard["id"])
+            open_action = menu.addAction(f"Open Sub-board (⧉ {done}/{total})")
+            open_action.triggered.connect(lambda: self.hub.navigate_to_board(subboard["id"]))
+        else:
+            create_action = menu.addAction("Create Sub-board")
+            create_action.triggered.connect(lambda: self.hub.open_or_create_subboard(task_id))
+        delete_action = menu.addAction("Delete Task")
+        delete_action.triggered.connect(lambda: self.hub.confirm_and_delete_task(task_id))
+        menu.addSeparator()
+
+        other_columns = [c for c in self._columns_cache if c["id"] != current_column_id]
+        if not other_columns:
+            no_columns_action = menu.addAction("No other columns")
+            no_columns_action.setEnabled(False)
+        else:
+            for col in other_columns:
+                action = menu.addAction(f"Move to {col['name']}")
+                action.triggered.connect(lambda checked=False, cid=col["id"]: self.handle_move(task_id, cid))
+        menu.exec(global_pos)
+
+    # -- column operations -------------------------------------------------
+
+    def column_name(self, column_id: str) -> str:
+        for col in self._columns_cache:
+            if col["id"] == column_id:
+                return col["name"]
+        return ""
+
+    def add_column_ui(self) -> None:
+        name, ok = QInputDialog.getText(self, "New Column", "Column name:")
+        if not ok or not name.strip():
+            return
+        try:
+            add_project_column(self.conn, self.board_id, name.strip())
+        except ValueError as e:
+            QMessageBox.warning(self, "Could not add column", str(e))
+            return
+        self.rebuild_columns()
+
+    def rename_column_ui(self, column_id: str) -> None:
+        current_name = self.column_name(column_id)
+        name, ok = QInputDialog.getText(self, "Rename Column", "Column name:", text=current_name)
+        if not ok or not name.strip():
+            return
+        try:
+            rename_project_column(self.conn, column_id, name.strip())
+        except ValueError as e:
+            QMessageBox.warning(self, "Could not rename column", str(e))
+            return
+        self.rebuild_columns()
+
+    def delete_column_ui(self, column_id: str) -> None:
+        name = self.column_name(column_id)
+        reply = QMessageBox.question(
+            self, "Delete column", f'Delete the "{name}" column?', QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            delete_project_column(self.conn, self.board_id, column_id)
+        except ValueError as e:
+            QMessageBox.warning(self, "Could not delete column", str(e))
+            return
+        self.rebuild_columns()
+
+    def move_column_ui(self, column_id: str, direction: int) -> None:
+        move_project_column(self.conn, self.board_id, column_id, direction)
+        self.rebuild_columns()
+
+
+class _ProjectTaskTableView(QWidget):
+    """Shared QTableWidget wrapper backing both the List and Missing Dates
+    views - same columns, same sort/double-click behavior, only the task
+    query differs (see ProjectListView/ProjectMissingDatesView below)."""
+
+    def __init__(self, conn: sqlite3.Connection, hub, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.hub = hub
+        self.board_id = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["Title", "Column", "Start", "Due", "Completed"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.setSortingEnabled(True)
+        self.table.itemDoubleClicked.connect(self._on_row_double_clicked)
+        layout.addWidget(self.table)
+
+    def load_board(self, board_id: str) -> None:
+        self.board_id = board_id
+        self.refresh()
+
+    def _fetch_tasks(self) -> list:
+        raise NotImplementedError
+
+    def refresh(self) -> None:
+        if not self.board_id:
+            self.table.setRowCount(0)
+            return
+
+        col_name_by_id = {c["id"]: c["name"] for c in get_project_columns(self.conn, self.board_id)}
+        tasks = self._fetch_tasks()
+
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(len(tasks))
+        for row, task in enumerate(tasks):
+            title_item = QTableWidgetItem(task["title"])
+            title_item.setData(Qt.UserRole, task["id"])
+            self.table.setItem(row, 0, title_item)
+            self.table.setItem(row, 1, QTableWidgetItem(col_name_by_id.get(task["column_id"], "")))
+            self.table.setItem(row, 2, QTableWidgetItem(task.get("start_date") or ""))
+            self.table.setItem(row, 3, QTableWidgetItem(task.get("due_date") or ""))
+            self.table.setItem(row, 4, QTableWidgetItem("Yes" if task["completed"] else ""))
+        self.table.setSortingEnabled(True)
+
+    def _on_row_double_clicked(self, item: QTableWidgetItem) -> None:
+        table = item.tableWidget()
+        task_id = table.item(item.row(), 0).data(Qt.UserRole)
+        self.hub.kanban_widget.edit_task(task_id)
+
+
+class ProjectListView(_ProjectTaskTableView):
+    """All tasks on the current board, any column."""
+
+    def _fetch_tasks(self) -> list:
+        return get_project_tasks_for_board(self.conn, self.board_id)
+
+
+class ProjectMissingDatesView(_ProjectTaskTableView):
+    """Same shape as ProjectListView, filtered to tasks missing a start
+    date, due date, or both - everything Gantt/Calendar would otherwise
+    drop into "Unscheduled" once those views exist."""
+
+    def _fetch_tasks(self) -> list:
+        return get_missing_dates_tasks(self.conn, self.board_id)
+
+
+class ProjectsHub(QWidget):
+    """The Projects page of the app's central QStackedWidget (see main()).
+    Owns all Projects UI state - current project/board, the breadcrumb,
+    and the three view widgets - entirely separately from KanbanBoard."""
+
+    VIEW_KANBAN = "kanban"
+    VIEW_LIST = "list"
+    VIEW_MISSING_DATES = "missing_dates"
+    VIEWS = [(VIEW_KANBAN, "Kanban"), (VIEW_LIST, "List"), (VIEW_MISSING_DATES, "Missing Dates")]
+
+    def __init__(self, conn: sqlite3.Connection, on_back_to_boards, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.on_back_to_boards = on_back_to_boards
+        self.current_project_id = None
+        self.current_board_id = None
+
+        outer = QVBoxLayout(self)
+
+        toolbar = QHBoxLayout()
+
+        back_btn = QPushButton("← Boards")
+        back_btn.setToolTip("Back to the Boards feature")
+        back_btn.clicked.connect(self.on_back_to_boards)
+        toolbar.addWidget(back_btn)
+
+        self.breadcrumb = BreadcrumbBar()
+        self.breadcrumb.crumb_clicked.connect(self.navigate_to_board)
+        toolbar.addWidget(self.breadcrumb, stretch=1)
+
+        self.add_task_btn = QPushButton("+ New Task")
+        self.add_task_btn.setProperty("accent", True)
+        self.add_task_btn.clicked.connect(lambda: self.kanban_widget.add_task())
+        toolbar.addWidget(self.add_task_btn)
+
+        self.add_col_btn = QPushButton("+ Column")
+        self.add_col_btn.clicked.connect(lambda: self.kanban_widget.add_column_ui())
+        self.add_col_btn.hide()
+        toolbar.addWidget(self.add_col_btn)
+
+        self.show_completed_btn = QPushButton("Show Completed")
+        self.show_completed_btn.setCheckable(True)
+        self.show_completed_btn.toggled.connect(self._on_show_completed_toggled)
+        toolbar.addWidget(self.show_completed_btn)
+
+        self.edit_board_btn = QPushButton("Edit Board")
+        self.edit_board_btn.setCheckable(True)
+        self.edit_board_btn.setToolTip("Show or hide column move/rename/delete controls")
+        self.edit_board_btn.toggled.connect(self._on_edit_board_toggled)
+        toolbar.addWidget(self.edit_board_btn)
+
+        self.delete_board_btn = QPushButton("Delete Sub-board")
+        self.delete_board_btn.setStyleSheet("color: #b00000;")
+        self.delete_board_btn.setToolTip(
+            "Delete this sub-board and everything below it (a Main Board can't be "
+            "deleted independently of its project - delete the project instead)"
+        )
+        self.delete_board_btn.clicked.connect(self._on_delete_board_clicked)
+        self.delete_board_btn.hide()
+        toolbar.addWidget(self.delete_board_btn)
+
+        outer.addLayout(toolbar)
+
+        view_row = QHBoxLayout()
+        self.view_buttons = {}
+        view_group = QButtonGroup(self)
+        view_group.setExclusive(True)
+        for key, label in self.VIEWS:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.clicked.connect(lambda checked=False, k=key: self.set_view(k))
+            view_group.addButton(btn)
+            view_row.addWidget(btn)
+            self.view_buttons[key] = btn
+        view_row.addStretch()
+        outer.addLayout(view_row)
+
+        self.content_stack = QStackedWidget()
+        outer.addWidget(self.content_stack, stretch=1)
+
+        self.kanban_widget = ProjectKanbanWidget(conn, self)
+        self.list_view = ProjectListView(conn, self)
+        self.missing_dates_view = ProjectMissingDatesView(conn, self)
+        self.content_stack.addWidget(self.kanban_widget)        # index 0 - VIEW_KANBAN
+        self.content_stack.addWidget(self.list_view)             # index 1 - VIEW_LIST
+        self.content_stack.addWidget(self.missing_dates_view)    # index 2 - VIEW_MISSING_DATES
+
+    # -- navigation --------------------------------------------------------
+
+    def load_project(self, project_id: str) -> None:
+        if self.current_project_id == project_id and self.current_board_id:
+            return
+        project = get_project(self.conn, project_id)
+        if project is None or not project.get("main_board_id"):
+            return
+        self.navigate_to_board(project["main_board_id"])
+
+    def navigate_to_board(self, board_id: str) -> None:
+        board = get_project_board(self.conn, board_id)
+        if board is None:
+            return
+
+        self.current_board_id = board_id
+        self.current_project_id = board["project_id"]
+
+        self.breadcrumb.set_crumbs(get_board_breadcrumb(self.conn, board_id))
+
+        self.edit_board_btn.blockSignals(True)
+        self.edit_board_btn.setChecked(False)
+        self.edit_board_btn.blockSignals(False)
+        self.add_col_btn.hide()
+        self.kanban_widget.set_edit_mode(False)
+
+        self.delete_board_btn.setVisible(board["parent_task_id"] is not None)
+
+        self.kanban_widget.load_board(board_id)
+        self.list_view.load_board(board_id)
+        self.missing_dates_view.load_board(board_id)
+
+        valid_views = {key for key, _ in self.VIEWS}
+        last_view = board.get("last_view") if board.get("last_view") in valid_views else self.VIEW_KANBAN
+        self.set_view(last_view, persist=False)
+
+    def refresh_all_views(self) -> None:
+        self.kanban_widget.refresh()
+        self.list_view.refresh()
+        self.missing_dates_view.refresh()
+
+    def set_view(self, view_key: str, persist: bool = True) -> None:
+        index = [key for key, _ in self.VIEWS].index(view_key)
+        self.content_stack.setCurrentIndex(index)
+        btn = self.view_buttons.get(view_key)
+        if btn is not None:
+            btn.blockSignals(True)
+            btn.setChecked(True)
+            btn.blockSignals(False)
+        if persist and self.current_board_id:
+            set_board_last_view(self.conn, self.current_board_id, view_key)
+
+    # -- toolbar toggles -----------------------------------------------
+
+    def _on_edit_board_toggled(self, checked: bool) -> None:
+        self.edit_board_btn.setText("Done Editing" if checked else "Edit Board")
+        self.add_col_btn.setVisible(checked)
+        self.kanban_widget.set_edit_mode(checked)
+
+    def _on_show_completed_toggled(self, checked: bool) -> None:
+        self.kanban_widget.set_show_completed(checked)
+        # The List/Missing Dates tables always show every task regardless -
+        # their own "Completed" column already surfaces the status, so a
+        # separate filter there would just be one more control to learn.
+
+    # -- sub-board create/navigate/delete --------------------------------
+
+    def open_or_create_subboard(self, task_id: str) -> None:
+        subboard = get_subboard_for_task(self.conn, task_id)
+        if subboard is None:
+            new_depth = len(get_board_ancestry(self.conn, self.current_board_id)) + 1
+            if new_depth >= PROJECT_BOARD_DEPTH_WARNING_THRESHOLD:
+                reply = QMessageBox.question(
+                    self, "Deep nesting",
+                    f"This board would be {new_depth} levels deep - consider whether this "
+                    "task should live on its own project instead.\n\nCreate the sub-board anyway?",
+                    QMessageBox.Yes | QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return
+            try:
+                subboard = add_subboard_for_task(self.conn, task_id)
+            except ValueError as e:
+                QMessageBox.warning(self, "Could not create sub-board", str(e))
+                return
+        self.navigate_to_board(subboard["id"])
+
+    def confirm_and_delete_task(self, task_id: str) -> None:
+        task = get_project_task(self.conn, task_id)
+        if task is None:
+            return
+
+        subboard = get_subboard_for_task(self.conn, task_id)
+        if subboard is not None:
+            counts = get_subtree_counts(self.conn, subboard["id"])
+            box = QMessageBox(self)
+            box.setWindowTitle("Delete task and everything below it")
+            box.setText(
+                f'"{task["title"]}" owns a sub-board containing {counts["board_count"]} board(s) '
+                f'and {counts["task_count"]} task(s) in total. Deleting this task permanently '
+                "deletes everything below it too."
+            )
+            delete_btn = box.addButton("Delete everything below this", QMessageBox.DestructiveRole)
+            box.addButton("Cancel", QMessageBox.RejectRole)
+            box.exec()
+            if box.clickedButton() is not delete_btn:
+                return
+        else:
+            reply = QMessageBox.question(
+                self, "Delete task", f'Delete "{task["title"]}"?', QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        delete_project_task(self.conn, task_id)
+        self.refresh_all_views()
+
+    def _on_delete_board_clicked(self) -> None:
+        if self.current_board_id:
+            self.confirm_and_delete_board(self.current_board_id)
+
+    def confirm_and_delete_board(self, board_id: str) -> None:
+        board = get_project_board(self.conn, board_id)
+        if board is None or board["parent_task_id"] is None:
+            return  # Main Board can't be deleted independently of its project
+
+        counts = get_subtree_counts(self.conn, board_id)
+        box = QMessageBox(self)
+        box.setWindowTitle("Delete sub-board and everything below it")
+        box.setText(
+            f'Delete "{board["name"]}"? It contains {counts["board_count"]} board(s) and '
+            f'{counts["task_count"]} task(s) in total, all of which will be permanently deleted.'
+        )
+        delete_btn = box.addButton("Delete everything below this", QMessageBox.DestructiveRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is not delete_btn:
+            return
+
+        ancestry = get_board_ancestry(self.conn, board_id)
+        parent_board_id = ancestry[-2]["id"] if len(ancestry) >= 2 else None
+        delete_project_board(self.conn, board_id)
+        if parent_board_id:
+            self.navigate_to_board(parent_board_id)
 
 
 # ---------------------------------------------------------------------------
@@ -3799,8 +5520,19 @@ def main():
     window.setWindowTitle(APP_TITLE)
     if not app_icon.isNull():
         window.setWindowIcon(app_icon)
+
+    central_stack = QStackedWidget()
+    window.setCentralWidget(central_stack)
+
     board = KanbanBoard(conn)
-    window.setCentralWidget(board)
+    projects_hub = ProjectsHub(conn, on_back_to_boards=lambda: central_stack.setCurrentWidget(board))
+    board.set_open_project_callback(
+        lambda project_id: (projects_hub.load_project(project_id), central_stack.setCurrentWidget(projects_hub))
+    )
+    central_stack.addWidget(board)
+    central_stack.addWidget(projects_hub)
+    central_stack.setCurrentWidget(board)
+
     window.resize(1150, 640)
     window.show()
 
