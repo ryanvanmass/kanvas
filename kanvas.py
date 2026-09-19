@@ -4449,6 +4449,13 @@ def default_project_task_start_date(conn: sqlite3.Connection, board_id: str, exc
     return parsed if parsed and parsed.isValid() else QDate.currentDate()
 
 
+def default_project_task_due_date(start_date: QDate) -> QDate:
+    """Suggested default due date: the day after start. Pure QDate math -
+    unlike default_project_task_start_date, doesn't need to look at the
+    board's other tasks."""
+    return start_date.addDays(1)
+
+
 class BreadcrumbBar(QWidget):
     """The "Project Name > Task A > Task A.2" navigation strip at the top
     of a Projects board view. Truncates the middle into a "..." popup menu
@@ -4566,12 +4573,13 @@ class NewProjectTaskDialog(QDialog):
         layout.addWidget(self.column_combo)
 
         layout.addWidget(QLabel("Start Date"))
-        self.start_date_check, self.start_date_edit = self._build_date_row(
-            layout, default_start_date or QDate.currentDate()
-        )
+        start_default = default_start_date or QDate.currentDate()
+        self.start_date_check, self.start_date_edit = self._build_date_row(layout, start_default)
 
         layout.addWidget(QLabel("Due Date"))
-        self.due_date_check, self.due_date_edit = self._build_date_row(layout, QDate.currentDate())
+        self.due_date_check, self.due_date_edit = self._build_date_row(
+            layout, default_project_task_due_date(start_default)
+        )
 
         layout.addWidget(QLabel("Link"))
         self.link_edit = QLineEdit()
@@ -4595,6 +4603,27 @@ class NewProjectTaskDialog(QDialog):
         layout.addLayout(btn_row)
 
         self.title_edit.setFocus()
+
+        # Due tracks Start (start+1) until the user actually edits Due
+        # themselves - see _sync_due_date_default's docstring.
+        self._due_date_user_edited = False
+        self.start_date_edit.dateChanged.connect(self._sync_due_date_default)
+        self.start_date_check.toggled.connect(self._sync_due_date_default)
+        self.due_date_edit.dateChanged.connect(self._mark_due_date_edited)
+
+    def _sync_due_date_default(self, *_args) -> None:
+        """Keeps Due tracking start+1 as Start changes, but only until the
+        user has actually edited Due themselves - checked via a dirty
+        flag set by _mark_due_date_edited, which blockSignals here is
+        careful not to trigger on this method's own programmatic update."""
+        if self._due_date_user_edited:
+            return
+        self.due_date_edit.blockSignals(True)
+        self.due_date_edit.setDate(default_project_task_due_date(self.start_date_edit.date()))
+        self.due_date_edit.blockSignals(False)
+
+    def _mark_due_date_edited(self, *_args) -> None:
+        self._due_date_user_edited = True
 
     @staticmethod
     def _build_date_row(layout, default_date: QDate):
@@ -4625,6 +4654,63 @@ class NewProjectTaskDialog(QDialog):
             "start_date": self.start_date_edit.date().toString("yyyy-MM-dd") if self.start_date_check.isChecked() else "",
             "due_date": self.due_date_edit.date().toString("yyyy-MM-dd") if self.due_date_check.isChecked() else "",
             "link": self.link_edit.text().strip(),
+        }
+
+
+class BulkAddProjectTasksDialog(QDialog):
+    """Quickly add several bare tasks (title only, no dates/notes/link)
+    to one column at once - type or paste one title per line. For
+    scheduling them, use the inline Start/Due editing in the List/
+    Missing Dates tables afterward rather than the full New Task dialog
+    per task."""
+
+    def __init__(self, columns: list, default_column_id, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Multiple Tasks")
+        self.resize(420, 420)
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("Column"))
+        self.column_combo = QComboBox()
+        for col in columns:
+            self.column_combo.addItem(col["name"], col["id"])
+        default_idx = next((i for i, c in enumerate(columns) if c["id"] == default_column_id), 0)
+        self.column_combo.setCurrentIndex(default_idx)
+        layout.addWidget(self.column_combo)
+
+        layout.addWidget(QLabel("Task Titles"))
+        self.titles_edit = QTextEdit()
+        self.titles_edit.setPlaceholderText("One task per line...")
+        layout.addWidget(self.titles_edit, stretch=1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        add_btn = QPushButton("Add Tasks")
+        add_btn.setProperty("accent", True)
+        add_btn.setDefault(True)
+        add_btn.clicked.connect(self._on_add)
+        btn_row.addWidget(add_btn)
+        layout.addLayout(btn_row)
+
+        self.titles_edit.setFocus()
+
+    def _titles(self) -> list:
+        return [line.strip() for line in self.titles_edit.toPlainText().splitlines() if line.strip()]
+
+    def _on_add(self) -> None:
+        if not self._titles():
+            QMessageBox.warning(self, "Titles required", "Enter at least one task title.")
+            return
+        self.accept()
+
+    def result_values(self) -> dict:
+        return {
+            "column_id": self.column_combo.currentData(),
+            "titles": self._titles(),
         }
 
 
@@ -4671,8 +4757,16 @@ class ProjectTaskCardDialog(QDialog):
 
         layout.addWidget(QLabel("Due Date"))
         self.due_date_check, self.due_date_edit = self._build_date_row(
-            layout, task.get("due_date"), QDate.currentDate()
+            layout, task.get("due_date"), default_project_task_due_date(self.start_date_edit.date())
         )
+
+        # Due tracks Start (start+1) until manually edited - but an
+        # already-saved due_date counts as "already edited" so it's never
+        # silently overwritten by a later Start change.
+        self._due_date_user_edited = self.due_date_check.isChecked()
+        self.start_date_edit.dateChanged.connect(self._sync_due_date_default)
+        self.start_date_check.toggled.connect(self._sync_due_date_default)
+        self.due_date_edit.dateChanged.connect(self._mark_due_date_edited)
 
         layout.addWidget(QLabel("Link"))
         self.link_edit = QLineEdit(task.get("link") or "")
@@ -4749,6 +4843,19 @@ class ProjectTaskCardDialog(QDialog):
         row.addWidget(edit, stretch=1)
         layout.addLayout(row)
         return check, edit
+
+    def _sync_due_date_default(self, *_args) -> None:
+        """See NewProjectTaskDialog's identical method - kept as a
+        separate copy since these are two unrelated QDialog subclasses,
+        not a shared base."""
+        if self._due_date_user_edited:
+            return
+        self.due_date_edit.blockSignals(True)
+        self.due_date_edit.setDate(default_project_task_due_date(self.start_date_edit.date()))
+        self.due_date_edit.blockSignals(False)
+
+    def _mark_due_date_edited(self, *_args) -> None:
+        self._due_date_user_edited = True
 
     def _on_save(self) -> None:
         if not self.title_edit.text().strip():
@@ -4920,6 +5027,19 @@ class ProjectKanbanWidget(QWidget):
         )
         self.hub.refresh_all_views()
 
+    def add_multiple_tasks_ui(self) -> None:
+        if not self._columns_cache:
+            QMessageBox.information(self, "No columns", "Add a column first.")
+            return
+        default_column_id = get_default_new_project_task_column(self.conn, self.board_id)
+        dialog = BulkAddProjectTasksDialog(self._columns_cache, default_column_id, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        values = dialog.result_values()
+        for title in values["titles"]:
+            add_project_task(self.conn, self.board_id, values["column_id"], title)
+        self.hub.refresh_all_views()
+
     def edit_task(self, task_id: str) -> None:
         task = get_project_task(self.conn, task_id)
         if not task:
@@ -5049,9 +5169,10 @@ class _TableDateDelegate(QStyledItemDelegate):
     unset still goes through the task dialog's "Set" checkbox.
 
     Needs a reference back to the owning view (rather than just conn) to
-    resolve the current board_id and to only apply the "default to right
-    after the last due date" behavior to the Start column - Due keeps
-    defaulting to today."""
+    resolve the current board_id and to apply column-specific defaults:
+    Start defaults to right after the last due date on the board; Due
+    defaults to the day after this row's own Start value (falling back
+    through Start's own default when Start is also empty)."""
 
     def __init__(self, view, parent=None):
         super().__init__(parent)
@@ -5069,6 +5190,14 @@ class _TableDateDelegate(QStyledItemDelegate):
             editor.setDate(existing)
         elif index.column() == self.view.COLUMN_START and self.view.board_id:
             editor.setDate(default_project_task_start_date(self.view.conn, self.view.board_id))
+        elif index.column() == self.view.COLUMN_DUE:
+            start_index = index.sibling(index.row(), self.view.COLUMN_START)
+            start_value = QDate.fromString(start_index.data(Qt.EditRole) or "", "yyyy-MM-dd")
+            if not start_value.isValid() and self.view.board_id:
+                start_value = default_project_task_start_date(self.view.conn, self.view.board_id)
+            editor.setDate(
+                default_project_task_due_date(start_value) if start_value.isValid() else QDate.currentDate()
+            )
         else:
             editor.setDate(QDate.currentDate())
 
@@ -5673,6 +5802,11 @@ class ProjectsHub(QWidget):
         self.add_task_btn.setProperty("accent", True)
         self.add_task_btn.clicked.connect(lambda: self.kanban_widget.add_task())
         toolbar.addWidget(self.add_task_btn)
+
+        self.add_multiple_btn = QPushButton("+ Add Multiple")
+        self.add_multiple_btn.setToolTip("Add several tasks at once, one per line")
+        self.add_multiple_btn.clicked.connect(lambda: self.kanban_widget.add_multiple_tasks_ui())
+        toolbar.addWidget(self.add_multiple_btn)
 
         self.add_col_btn = QPushButton("+ Column")
         self.add_col_btn.clicked.connect(lambda: self.kanban_widget.add_column_ui())
