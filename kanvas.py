@@ -34,14 +34,14 @@ import threading
 from datetime import datetime, date, timedelta, time as dt_time
 
 from PySide6.QtCore import Qt, QRect, QDate, QTime, QDateTime, QTimer, QObject, Signal, QPropertyAnimation, QEasingCurve
-from PySide6.QtGui import QIcon, QAction, QFont, QColor, QCursor
+from PySide6.QtGui import QIcon, QAction, QFont, QColor, QCursor, QPainter, QPen, QBrush, QFontMetrics
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QListView, QComboBox,
     QAbstractItemView, QInputDialog, QMessageBox, QDialog, QLineEdit, QTextEdit,
     QCheckBox, QDateEdit, QSpinBox, QMenu, QToolButton, QStackedWidget,
     QDateTimeEdit, QTimeEdit, QRadioButton, QButtonGroup, QSystemTrayIcon,
-    QTableWidget, QTableWidgetItem, QHeaderView,
+    QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea, QGridLayout, QSizePolicy,
 )
 
 APP_TITLE = "Kanvas"
@@ -81,6 +81,15 @@ PROJECT_DEFAULT_COLUMNS = ["Today", "In Progress", "Blocked", "Complete"]
 # Soft warning threshold for sub-board nesting depth (Main Board = depth 1).
 # Nothing blocks creation past this depth - it's just a nudge.
 PROJECT_BOARD_DEPTH_WARNING_THRESHOLD = 10
+
+# Gantt bars and Calendar chips are colored by column (swimlane) so the
+# "grouped by column" structure reads visually in both views. Cycles once
+# there are more columns than colors - fine for a handful of columns.
+CALENDAR_CHIP_COLORS = ["#4F46E5", "#0891b2", "#059669", "#d97706", "#db2777", "#7c3aed"]
+
+
+def project_column_color(column_position: int) -> str:
+    return CALENDAR_CHIP_COLORS[column_position % len(CALENDAR_CHIP_COLORS)]
 
 
 # ---------------------------------------------------------------------------
@@ -1702,6 +1711,68 @@ def get_missing_dates_tasks(conn: sqlite3.Connection, board_id: str) -> list:
         (board_id,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_scheduled_project_tasks(conn: sqlite3.Connection, board_id: str) -> list:
+    """Complement of get_missing_dates_tasks() - tasks with BOTH start_date
+    and due_date set. Feeds the Gantt chart's bars; anything missing
+    either date falls into the Unscheduled tray via
+    get_missing_dates_tasks() itself, not a re-implementation here."""
+    rows = conn.execute(
+        "SELECT * FROM project_tasks WHERE board_id = ? "
+        "AND start_date IS NOT NULL AND start_date != '' "
+        "AND due_date IS NOT NULL AND due_date != '' "
+        "ORDER BY start_date ASC, position ASC",
+        (board_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_calendar_project_tasks(conn: sqlite3.Connection, board_id: str) -> list:
+    """Tasks with due_date set (start_date optional) - feeds the Calendar
+    view. A due-only task renders as a single-day chip on due_date; a
+    task with both dates renders as a spanning chip. A task missing
+    due_date entirely never appears on the calendar. Deliberately
+    overlaps with get_scheduled_project_tasks()/get_missing_dates_tasks()
+    - each view is answering a different question ("can I draw a bar?"
+    vs. "does it have a day to sit on?")."""
+    rows = conn.execute(
+        "SELECT * FROM project_tasks WHERE board_id = ? "
+        "AND due_date IS NOT NULL AND due_date != '' "
+        "ORDER BY due_date ASC, position ASC",
+        (board_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def build_project_task_meta_parts(conn: sqlite3.Connection, task: dict) -> list:
+    """Shared meta-line builder - dates/subtask progress/sub-board
+    badge/link - reused by ProjectKanbanWidget's card text and by the
+    Gantt/Calendar views' tooltips, so this logic exists exactly once."""
+    meta_parts = []
+    if task.get("start_date") and task.get("due_date"):
+        meta_parts.append(f"{task['start_date']} → {task['due_date']}")
+    elif task.get("due_date"):
+        meta_parts.append(f"Due {task['due_date']}")
+    elif task.get("start_date"):
+        meta_parts.append(f"Starts {task['start_date']}")
+    else:
+        meta_parts.append("◇ no dates set")
+
+    subtasks = get_project_subtasks(conn, task["id"])
+    if subtasks:
+        done_count = sum(1 for s in subtasks if s["done"])
+        meta_parts.append(f"{done_count}/{len(subtasks)} done")
+
+    subboard = get_subboard_for_task(conn, task["id"])
+    if subboard is not None:
+        done, total = get_subtree_task_progress(conn, subboard["id"])
+        meta_parts.append(f"⧉ {done}/{total}")
+
+    if task.get("link"):
+        meta_parts.append("Link")
+
+    return meta_parts
 
 
 def update_project_task(
@@ -4785,29 +4856,7 @@ class ProjectKanbanWidget(QWidget):
             col_widget.set_count(len(tasks))
 
     def _task_card_text(self, task: dict) -> str:
-        meta_parts = []
-        if task.get("start_date") and task.get("due_date"):
-            meta_parts.append(f"{task['start_date']} → {task['due_date']}")
-        elif task.get("due_date"):
-            meta_parts.append(f"Due {task['due_date']}")
-        elif task.get("start_date"):
-            meta_parts.append(f"Starts {task['start_date']}")
-        else:
-            meta_parts.append("◇ no dates set")
-
-        subtasks = get_project_subtasks(self.conn, task["id"])
-        if subtasks:
-            done_count = sum(1 for s in subtasks if s["done"])
-            meta_parts.append(f"{done_count}/{len(subtasks)} done")
-
-        subboard = get_subboard_for_task(self.conn, task["id"])
-        if subboard is not None:
-            done, total = get_subtree_task_progress(self.conn, subboard["id"])
-            meta_parts.append(f"⧉ {done}/{total}")
-
-        if task.get("link"):
-            meta_parts.append("Link")
-
+        meta_parts = build_project_task_meta_parts(self.conn, task)
         text = task["title"]
         if meta_parts:
             text += "\n" + "   ".join(meta_parts)
@@ -5026,6 +5075,474 @@ class ProjectMissingDatesView(_ProjectTaskTableView):
         return get_missing_dates_tasks(self.conn, self.board_id)
 
 
+class ProjectGanttChart(QWidget):
+    """The painted canvas half of the Gantt view: one horizontal bar per
+    scheduled task (both start_date and due_date set), grouped into
+    swimlanes by column. No dependency arrows - project_tasks has no
+    dependency field, matching the issue's "No dependency arrows in v1".
+
+    This is the only custom-painted widget in the app; everywhere else
+    is built from standard Qt widgets/layouts. A free date axis with
+    variable-width bars doesn't map cleanly onto a layout of child
+    widgets the way the Calendar's day grid does (see
+    ProjectCalendarView), so painting is the natural fit here."""
+
+    DAY_WIDTH = 24
+    ROW_HEIGHT = 32
+    ROW_VPAD = 6
+    LANE_HEADER_HEIGHT = 28
+    SWIMLANE_GAP = 12
+    DATE_RULER_HEIGHT = 24
+    LEFT_MARGIN = 12
+    PADDING_DAYS = 3
+    TODAY_MARKER_COLOR = "#f2545b"
+
+    task_clicked = Signal(str)
+
+    def __init__(self, conn: sqlite3.Connection, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.board_id = None
+        self._columns = []
+        self._tasks_by_column = {}
+        self._range_start = None
+        self._range_end = None
+        self._task_rects = []  # [(QRect, task_id), ...] - rebuilt each paint
+        self.setFixedSize(1, 1)
+
+    def load_board(self, board_id: str) -> None:
+        self.board_id = board_id
+        self.refresh()
+
+    def refresh(self) -> None:
+        self._recompute_layout()
+        self.update()
+
+    def has_scheduled_tasks(self) -> bool:
+        return self._range_start is not None
+
+    def _recompute_layout(self) -> None:
+        self._columns = get_project_columns(self.conn, self.board_id) if self.board_id else []
+        scheduled = get_scheduled_project_tasks(self.conn, self.board_id) if self.board_id else []
+
+        if not scheduled:
+            self._range_start = None
+            self._range_end = None
+            self._tasks_by_column = {}
+            self.setFixedSize(1, 1)
+            return
+
+        starts = [QDate.fromString(t["start_date"], "yyyy-MM-dd") for t in scheduled]
+        dues = [QDate.fromString(t["due_date"], "yyyy-MM-dd") for t in scheduled]
+        self._range_start = min(starts).addDays(-self.PADDING_DAYS)
+        self._range_end = max(dues).addDays(self.PADDING_DAYS)
+
+        self._tasks_by_column = {c["id"]: [] for c in self._columns}
+        for task in scheduled:
+            self._tasks_by_column.setdefault(task["column_id"], []).append(task)
+
+        total_days = self._range_start.daysTo(self._range_end) + 1
+        width = self.LEFT_MARGIN * 2 + total_days * self.DAY_WIDTH
+
+        height = self.DATE_RULER_HEIGHT
+        for col in self._columns:
+            row_count = max(1, len(self._tasks_by_column.get(col["id"], [])))
+            height += self.LANE_HEADER_HEIGHT + row_count * self.ROW_HEIGHT + self.SWIMLANE_GAP
+
+        self.setFixedSize(max(width, 1), max(height, 1))
+
+    def _x_for_date(self, d: QDate) -> int:
+        return self.LEFT_MARGIN + self._range_start.daysTo(d) * self.DAY_WIDTH
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        self._task_rects = []
+
+        if self._range_start is None:
+            painter.end()
+            return
+
+        # Date ruler: a tick + short label every 7 days across the range.
+        painter.setPen(QColor("#9a9a9a"))
+        d = self._range_start
+        while d <= self._range_end:
+            if self._range_start.daysTo(d) % 7 == 0:
+                x = self._x_for_date(d)
+                painter.drawText(x + 2, self.DATE_RULER_HEIGHT - 8, d.toString("MMM d"))
+                painter.drawLine(x, self.DATE_RULER_HEIGHT - 4, x, self.height())
+            d = d.addDays(1)
+
+        y = self.DATE_RULER_HEIGHT
+        for col in self._columns:
+            tasks = self._tasks_by_column.get(col["id"], [])
+            row_count = max(1, len(tasks))
+            group_height = self.LANE_HEADER_HEIGHT + row_count * self.ROW_HEIGHT
+
+            header_rect = QRect(0, y, self.width(), self.LANE_HEADER_HEIGHT)
+            painter.fillRect(header_rect, QColor("#232427"))
+            painter.setPen(QColor("#e8e8e8"))
+            painter.drawText(header_rect.adjusted(self.LEFT_MARGIN, 0, 0, 0), Qt.AlignVCenter, col["name"])
+
+            row_top = y + self.LANE_HEADER_HEIGHT
+            if not tasks:
+                painter.setPen(QColor("#6e6e6e"))
+                painter.drawText(
+                    QRect(self.LEFT_MARGIN, row_top, self.width(), self.ROW_HEIGHT),
+                    Qt.AlignVCenter, "No scheduled tasks",
+                )
+            else:
+                bar_color = QColor(project_column_color(col["position"]))
+                for i, task in enumerate(tasks):
+                    start = QDate.fromString(task["start_date"], "yyyy-MM-dd")
+                    due = QDate.fromString(task["due_date"], "yyyy-MM-dd")
+                    x1 = self._x_for_date(start)
+                    x2 = self._x_for_date(due) + self.DAY_WIDTH
+                    bar_y = row_top + i * self.ROW_HEIGHT + self.ROW_VPAD // 2
+                    bar_h = self.ROW_HEIGHT - self.ROW_VPAD
+                    rect = QRect(x1, bar_y, max(x2 - x1, 4), bar_h)
+                    painter.fillRect(rect, bar_color)
+                    painter.setPen(QColor("#ffffff"))
+                    painter.drawText(rect.adjusted(4, 0, -4, 0), Qt.AlignVCenter, task["title"])
+                    self._task_rects.append((rect, task["id"]))
+
+            y += group_height + self.SWIMLANE_GAP
+
+        today = QDate.currentDate()
+        if self._range_start <= today <= self._range_end:
+            x = self._x_for_date(today) + self.DAY_WIDTH // 2
+            painter.setPen(QPen(QColor(self.TODAY_MARKER_COLOR), 1, Qt.DashLine))
+            painter.drawLine(x, 0, x, self.height())
+            painter.setPen(QColor(self.TODAY_MARKER_COLOR))
+            painter.drawText(x + 3, 12, "Today")
+
+        painter.end()
+
+    def mousePressEvent(self, event) -> None:
+        pos = event.position().toPoint()
+        for rect, task_id in self._task_rects:
+            if rect.contains(pos):
+                self.task_clicked.emit(task_id)
+                return
+        super().mousePressEvent(event)
+
+
+class ProjectGanttView(QWidget):
+    """The Gantt page ProjectsHub holds: a scrollable painted chart on
+    top, and the exact same Missing Dates table - reused via
+    composition, not reimplemented - as an "Unscheduled" tray below it,
+    per the issue's "this tray is the same underlying query as the
+    Missing Dates view, scoped to the board.\""""
+
+    UNSCHEDULED_TRAY_HEIGHT = 180
+
+    def __init__(self, conn: sqlite3.Connection, hub, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.hub = hub
+
+        outer = QVBoxLayout(self)
+
+        self.chart = ProjectGanttChart(conn)
+        self.chart.task_clicked.connect(lambda task_id: self.hub.kanban_widget.edit_task(task_id))
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidget(self.chart)
+        self.scroll_area.setWidgetResizable(False)
+        outer.addWidget(self.scroll_area, stretch=1)
+
+        self.empty_label = QLabel("No scheduled tasks yet")
+        self.empty_label.setStyleSheet("color: #6e6e6e; padding: 16px;")
+        self.empty_label.setAlignment(Qt.AlignCenter)
+        self.empty_label.hide()
+        outer.addWidget(self.empty_label, stretch=1)
+
+        unscheduled_label = QLabel("UNSCHEDULED")
+        unscheduled_label.setStyleSheet(
+            "color: #9a9a9a; font-weight: bold; font-size: 11px; padding: 8px 0 2px 0;"
+        )
+        outer.addWidget(unscheduled_label)
+
+        self.unscheduled = ProjectMissingDatesView(conn, hub)
+        self.unscheduled.setFixedHeight(self.UNSCHEDULED_TRAY_HEIGHT)
+        outer.addWidget(self.unscheduled)
+
+    def load_board(self, board_id: str) -> None:
+        self.chart.load_board(board_id)
+        self.unscheduled.load_board(board_id)
+        self._update_empty_state()
+
+    def refresh(self) -> None:
+        self.chart.refresh()
+        self.unscheduled.refresh()
+        self._update_empty_state()
+
+    def _update_empty_state(self) -> None:
+        has_scheduled = self.chart.has_scheduled_tasks()
+        self.scroll_area.setVisible(has_scheduled)
+        self.empty_label.setVisible(not has_scheduled)
+
+
+class ProjectCalendarView(QWidget):
+    """Month/week calendar grid. Unlike Gantt's free date axis, days are
+    naturally grid-shaped: a real QGridLayout gives multi-day-chip
+    spanning via colSpan and QPushButton chips get clicking for free,
+    matching this app's existing "clear and rebuild a layout" idiom
+    (see ProjectKanbanWidget.rebuild_columns) rather than introducing a
+    second painted widget where a grid already fits."""
+
+    MODE_MONTH = "month"
+    MODE_WEEK = "week"
+    WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+    CALENDAR_MAX_LANES = 3
+    DAY_CELL_MIN_WIDTH = 90
+    CHIP_HEIGHT = 20
+
+    def __init__(self, conn: sqlite3.Connection, hub, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.hub = hub
+        self.board_id = None
+        self.mode = self.MODE_MONTH
+        self.anchor = QDate.currentDate()
+
+        outer = QVBoxLayout(self)
+
+        header_row = QHBoxLayout()
+        prev_btn = QPushButton("◀")
+        prev_btn.setFixedWidth(32)
+        prev_btn.clicked.connect(self._go_previous)
+        header_row.addWidget(prev_btn)
+
+        today_btn = QPushButton("Today")
+        today_btn.clicked.connect(self._go_today)
+        header_row.addWidget(today_btn)
+
+        next_btn = QPushButton("▶")
+        next_btn.setFixedWidth(32)
+        next_btn.clicked.connect(self._go_next)
+        header_row.addWidget(next_btn)
+
+        self.range_label = QLabel()
+        self.range_label.setAlignment(Qt.AlignCenter)
+        self.range_label.setStyleSheet("font-weight: bold; font-size: 14px;")
+        header_row.addWidget(self.range_label, stretch=1)
+
+        month_btn = QPushButton("Month")
+        month_btn.setCheckable(True)
+        month_btn.setChecked(True)
+        week_btn = QPushButton("Week")
+        week_btn.setCheckable(True)
+        mode_group = QButtonGroup(self)
+        mode_group.setExclusive(True)
+        mode_group.addButton(month_btn)
+        mode_group.addButton(week_btn)
+        month_btn.clicked.connect(lambda: self._set_mode(self.MODE_MONTH))
+        week_btn.clicked.connect(lambda: self._set_mode(self.MODE_WEEK))
+        header_row.addWidget(month_btn)
+        header_row.addWidget(week_btn)
+
+        outer.addLayout(header_row)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        self.grid_container = QWidget()
+        self.grid = QGridLayout(self.grid_container)
+        self.grid.setSpacing(2)
+        scroll_area.setWidget(self.grid_container)
+        outer.addWidget(scroll_area, stretch=1)
+
+        for col, label_text in enumerate(self.WEEKDAY_LABELS):
+            header_label = QLabel(label_text)
+            header_label.setAlignment(Qt.AlignCenter)
+            header_label.setStyleSheet(
+                "color: #9a9a9a; font-weight: bold; font-size: 11px; padding: 4px;"
+            )
+            self.grid.addWidget(header_label, 0, col)
+        for col in range(7):
+            self.grid.setColumnMinimumWidth(col, self.DAY_CELL_MIN_WIDTH)
+            self.grid.setColumnStretch(col, 1)
+
+    # -- board load / navigation -----------------------------------------
+
+    def load_board(self, board_id: str) -> None:
+        self.board_id = board_id
+        self.mode = self.MODE_MONTH
+        self.anchor = QDate.currentDate()
+        self._rebuild()
+
+    def refresh(self) -> None:
+        self._rebuild()
+
+    def _set_mode(self, mode: str) -> None:
+        self.mode = mode
+        self._rebuild()
+
+    def _go_previous(self) -> None:
+        self.anchor = self.anchor.addMonths(-1) if self.mode == self.MODE_MONTH else self.anchor.addDays(-7)
+        self._rebuild()
+
+    def _go_next(self) -> None:
+        self.anchor = self.anchor.addMonths(1) if self.mode == self.MODE_MONTH else self.anchor.addDays(7)
+        self._rebuild()
+
+    def _go_today(self) -> None:
+        self.anchor = QDate.currentDate()
+        self._rebuild()
+
+    # -- grid rebuild ------------------------------------------------------
+
+    def _visible_weeks(self) -> list:
+        """Returns a list of weeks, each a list of 7 QDate (Mon..Sun)."""
+        if self.mode == self.MODE_WEEK:
+            week_start = self.anchor.addDays(-(self.anchor.dayOfWeek() - 1))
+            return [[week_start.addDays(i) for i in range(7)]]
+
+        first_of_month = QDate(self.anchor.year(), self.anchor.month(), 1)
+        grid_start = first_of_month.addDays(-(first_of_month.dayOfWeek() - 1))
+        last_of_month = first_of_month.addDays(first_of_month.daysInMonth() - 1)
+        weeks = []
+        week_start = grid_start
+        while week_start <= last_of_month:
+            weeks.append([week_start.addDays(i) for i in range(7)])
+            week_start = week_start.addDays(7)
+        return weeks
+
+    def _rebuild(self) -> None:
+        self._clear_grid_rows()
+
+        if self.mode == self.MODE_MONTH:
+            self.range_label.setText(self.anchor.toString("MMMM yyyy"))
+        else:
+            week_start = self.anchor.addDays(-(self.anchor.dayOfWeek() - 1))
+            self.range_label.setText(
+                f"{week_start.toString('MMM d')} - {week_start.addDays(6).toString('MMM d, yyyy')}"
+            )
+
+        if not self.board_id:
+            return
+
+        weeks = self._visible_weeks()
+        tasks = get_calendar_project_tasks(self.conn, self.board_id)
+        task_ranges = {t["id"]: self._effective_range(t) for t in tasks}
+        current_month = self.anchor.month() if self.mode == self.MODE_MONTH else None
+
+        grid_row = 1
+        for week in weeks:
+            grid_row = self._build_week_row(week, tasks, task_ranges, grid_row, current_month)
+
+    def _clear_grid_rows(self) -> None:
+        # The first 7 items (row 0's weekday headers) are added once in
+        # __init__ and never removed - everything after them is rebuilt
+        # from scratch on every navigation/mode change.
+        while self.grid.count() > 7:
+            item = self.grid.takeAt(self.grid.count() - 1)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _build_week_row(self, week: list, tasks: list, task_ranges: dict, grid_row: int, current_month) -> int:
+        week_start, week_end = week[0], week[6]
+
+        day_number_row = grid_row
+        for col, day in enumerate(week):
+            in_month = current_month is None or day.month() == current_month
+            is_today = day == QDate.currentDate()
+            label = QLabel(str(day.day()))
+            color = "#e8e8e8" if in_month else "#5a5a5a"
+            weight = "bold" if is_today else "normal"
+            bg = f"background-color: {ACCENT_COLOR}; border-radius: 4px;" if is_today else ""
+            label.setStyleSheet(f"color: {color}; font-weight: {weight}; padding: 2px 4px; {bg}")
+            self.grid.addWidget(label, day_number_row, col)
+
+        # -- lane assignment (greedy "first available lane", per week-row) --
+        overlapping = [
+            t for t in tasks
+            if task_ranges[t["id"]][0] <= week_end and task_ranges[t["id"]][1] >= week_start
+        ]
+        overlapping.sort(
+            key=lambda t: (
+                task_ranges[t["id"]][0],
+                -task_ranges[t["id"]][0].daysTo(task_ranges[t["id"]][1]),
+                t["title"],
+            )
+        )
+
+        lane_end_dates = []
+        task_lane = {}
+        for t in overlapping:
+            eff_start, eff_end = task_ranges[t["id"]]
+            placed = False
+            for lane_idx, lane_end in enumerate(lane_end_dates):
+                if lane_end < eff_start:
+                    lane_end_dates[lane_idx] = eff_end
+                    task_lane[t["id"]] = lane_idx
+                    placed = True
+                    break
+            if not placed:
+                lane_end_dates.append(eff_end)
+                task_lane[t["id"]] = len(lane_end_dates) - 1
+
+        visible_lane_count = min(len(lane_end_dates), self.CALENDAR_MAX_LANES)
+        for t in overlapping:
+            lane_idx = task_lane[t["id"]]
+            if lane_idx >= visible_lane_count:
+                continue
+
+            eff_start, eff_end = task_ranges[t["id"]]
+            seg_start = max(eff_start, week_start)
+            seg_end = min(eff_end, week_end)
+            col = week.index(seg_start)
+            col_span = seg_start.daysTo(seg_end) + 1
+
+            label_text = t["title"]
+            if eff_start < seg_start:
+                label_text = "◂ " + label_text
+            if eff_end > seg_end:
+                label_text = label_text + " ▸"
+
+            chip = QPushButton(label_text)
+            chip.setFixedHeight(self.CHIP_HEIGHT)
+            chip.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            chip.setToolTip("\n".join(build_project_task_meta_parts(self.conn, t)))
+            fill = project_column_color(self._column_position(t["column_id"]))
+            chip.setStyleSheet(
+                f"QPushButton {{ background-color: {fill}; color: white; border: none; "
+                f"border-radius: 4px; text-align: left; padding: 1px 6px; font-size: 11px; }}"
+                f"QPushButton:hover {{ background-color: {fill}; }}"
+            )
+            chip.clicked.connect(lambda checked=False, tid=t["id"]: self.hub.kanban_widget.edit_task(tid))
+            self.grid.addWidget(chip, grid_row + 1 + lane_idx, col, 1, col_span)
+
+        overflow_row = grid_row + 1 + visible_lane_count
+        for col, day in enumerate(week):
+            hidden_titles = [
+                t["title"] for t in overlapping
+                if task_lane[t["id"]] >= self.CALENDAR_MAX_LANES
+                and task_ranges[t["id"]][0] <= day <= task_ranges[t["id"]][1]
+            ]
+            if hidden_titles:
+                overflow_label = QLabel(f"+{len(hidden_titles)} more")
+                overflow_label.setStyleSheet("color: #9a9a9a; font-size: 10px; padding: 1px 4px;")
+                overflow_label.setToolTip("\n".join(hidden_titles))
+                self.grid.addWidget(overflow_label, overflow_row, col)
+
+        return overflow_row + 1
+
+    def _effective_range(self, task: dict) -> tuple:
+        """(start, due) - falls back to due for both ends when start_date
+        isn't set, giving a due-only task a single-day span."""
+        due = QDate.fromString(task["due_date"], "yyyy-MM-dd")
+        start = QDate.fromString(task.get("start_date") or "", "yyyy-MM-dd")
+        if not start.isValid():
+            start = due
+        return start, due
+
+    def _column_position(self, column_id: str) -> int:
+        column = get_project_column(self.conn, column_id)
+        return column["position"] if column else 0
+
+
 class ProjectsHub(QWidget):
     """The Projects page of the app's central QStackedWidget (see main()).
     Owns all Projects UI state - current project/board, the breadcrumb,
@@ -5034,7 +5551,12 @@ class ProjectsHub(QWidget):
     VIEW_KANBAN = "kanban"
     VIEW_LIST = "list"
     VIEW_MISSING_DATES = "missing_dates"
-    VIEWS = [(VIEW_KANBAN, "Kanban"), (VIEW_LIST, "List"), (VIEW_MISSING_DATES, "Missing Dates")]
+    VIEW_GANTT = "gantt"
+    VIEW_CALENDAR = "calendar"
+    VIEWS = [
+        (VIEW_KANBAN, "Kanban"), (VIEW_LIST, "List"), (VIEW_MISSING_DATES, "Missing Dates"),
+        (VIEW_GANTT, "Gantt"), (VIEW_CALENDAR, "Calendar"),
+    ]
 
     def __init__(self, conn: sqlite3.Connection, on_back_to_boards, parent=None):
         super().__init__(parent)
@@ -5109,9 +5631,13 @@ class ProjectsHub(QWidget):
         self.kanban_widget = ProjectKanbanWidget(conn, self)
         self.list_view = ProjectListView(conn, self)
         self.missing_dates_view = ProjectMissingDatesView(conn, self)
+        self.gantt_view = ProjectGanttView(conn, self)
+        self.calendar_view = ProjectCalendarView(conn, self)
         self.content_stack.addWidget(self.kanban_widget)        # index 0 - VIEW_KANBAN
         self.content_stack.addWidget(self.list_view)             # index 1 - VIEW_LIST
         self.content_stack.addWidget(self.missing_dates_view)    # index 2 - VIEW_MISSING_DATES
+        self.content_stack.addWidget(self.gantt_view)            # index 3 - VIEW_GANTT
+        self.content_stack.addWidget(self.calendar_view)         # index 4 - VIEW_CALENDAR
 
     # -- navigation --------------------------------------------------------
 
@@ -5144,6 +5670,8 @@ class ProjectsHub(QWidget):
         self.kanban_widget.load_board(board_id)
         self.list_view.load_board(board_id)
         self.missing_dates_view.load_board(board_id)
+        self.gantt_view.load_board(board_id)
+        self.calendar_view.load_board(board_id)
 
         valid_views = {key for key, _ in self.VIEWS}
         last_view = board.get("last_view") if board.get("last_view") in valid_views else self.VIEW_KANBAN
@@ -5153,6 +5681,8 @@ class ProjectsHub(QWidget):
         self.kanban_widget.refresh()
         self.list_view.refresh()
         self.missing_dates_view.refresh()
+        self.gantt_view.refresh()
+        self.calendar_view.refresh()
 
     def set_view(self, view_key: str, persist: bool = True) -> None:
         index = [key for key, _ in self.VIEWS].index(view_key)
