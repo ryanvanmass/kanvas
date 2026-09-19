@@ -1746,6 +1746,24 @@ def get_calendar_project_tasks(conn: sqlite3.Connection, board_id: str) -> list:
     return [dict(r) for r in rows]
 
 
+def get_latest_due_date(conn: sqlite3.Connection, board_id: str, exclude_task_id: str = None):
+    """The most recent due_date set among this board's tasks (lexicographic
+    MAX works since dates are stored as zero-padded yyyy-MM-dd strings),
+    or None if none have one. Used to default a new task's start date to
+    right where the last one left off, instead of always defaulting to
+    today - see default_project_task_start_date()."""
+    query = (
+        "SELECT MAX(due_date) AS d FROM project_tasks WHERE board_id = ? "
+        "AND due_date IS NOT NULL AND due_date != ''"
+    )
+    params = [board_id]
+    if exclude_task_id:
+        query += " AND id != ?"
+        params.append(exclude_task_id)
+    row = conn.execute(query, params).fetchone()
+    return row["d"] if row and row["d"] else None
+
+
 def build_project_task_meta_parts(conn: sqlite3.Connection, task: dict) -> list:
     """Shared meta-line builder - dates/subtask progress/sub-board
     badge/link - reused by ProjectKanbanWidget's card text and by the
@@ -4419,6 +4437,18 @@ class KanbanBoard(QWidget):
 # reference to KanbanBoard or any of its state, and vice versa.
 # ---------------------------------------------------------------------------
 
+def default_project_task_start_date(conn: sqlite3.Connection, board_id: str, exclude_task_id: str = None) -> QDate:
+    """Suggested default for a new/unset start date: right where the
+    last already-scheduled task on this board leaves off (its due_date),
+    so tasks chain sequentially instead of every new task defaulting to
+    today. Falls back to today when nothing on the board has a due_date
+    yet. QDate-returning (unlike the plain-string data layer functions
+    it wraps), so it lives here in the UI section rather than above."""
+    latest_due = get_latest_due_date(conn, board_id, exclude_task_id=exclude_task_id)
+    parsed = QDate.fromString(latest_due, "yyyy-MM-dd") if latest_due else None
+    return parsed if parsed and parsed.isValid() else QDate.currentDate()
+
+
 class BreadcrumbBar(QWidget):
     """The "Project Name > Task A > Task A.2" navigation strip at the top
     of a Projects board view. Truncates the middle into a "..." popup menu
@@ -4516,7 +4546,7 @@ class NewProjectTaskDialog(QDialog):
     NewTaskDialog, plus a second date (start_date, for the Gantt/Calendar
     views a later phase adds) and "link" instead of "joplin_link"."""
 
-    def __init__(self, columns: list, default_column_id, parent=None):
+    def __init__(self, columns: list, default_column_id, parent=None, default_start_date: QDate = None):
         super().__init__(parent)
         self.setWindowTitle("New Task")
         self.resize(420, 460)
@@ -4536,10 +4566,12 @@ class NewProjectTaskDialog(QDialog):
         layout.addWidget(self.column_combo)
 
         layout.addWidget(QLabel("Start Date"))
-        self.start_date_check, self.start_date_edit = self._build_date_row(layout)
+        self.start_date_check, self.start_date_edit = self._build_date_row(
+            layout, default_start_date or QDate.currentDate()
+        )
 
         layout.addWidget(QLabel("Due Date"))
-        self.due_date_check, self.due_date_edit = self._build_date_row(layout)
+        self.due_date_check, self.due_date_edit = self._build_date_row(layout, QDate.currentDate())
 
         layout.addWidget(QLabel("Link"))
         self.link_edit = QLineEdit()
@@ -4565,14 +4597,14 @@ class NewProjectTaskDialog(QDialog):
         self.title_edit.setFocus()
 
     @staticmethod
-    def _build_date_row(layout):
+    def _build_date_row(layout, default_date: QDate):
         row = QHBoxLayout()
         check = QCheckBox("Set")
         row.addWidget(check)
         edit = QDateEdit()
         edit.setCalendarPopup(True)
         edit.setDisplayFormat("yyyy-MM-dd")
-        edit.setDate(QDate.currentDate())
+        edit.setDate(default_date)
         edit.setEnabled(False)
         check.toggled.connect(edit.setEnabled)
         row.addWidget(edit, stretch=1)
@@ -4632,10 +4664,15 @@ class ProjectTaskCardDialog(QDialog):
         layout.addWidget(self.completed_check)
 
         layout.addWidget(QLabel("Start Date"))
-        self.start_date_check, self.start_date_edit = self._build_date_row(layout, task.get("start_date"))
+        default_start = default_project_task_start_date(conn, task["board_id"], exclude_task_id=task["id"])
+        self.start_date_check, self.start_date_edit = self._build_date_row(
+            layout, task.get("start_date"), default_start
+        )
 
         layout.addWidget(QLabel("Due Date"))
-        self.due_date_check, self.due_date_edit = self._build_date_row(layout, task.get("due_date"))
+        self.due_date_check, self.due_date_edit = self._build_date_row(
+            layout, task.get("due_date"), QDate.currentDate()
+        )
 
         layout.addWidget(QLabel("Link"))
         self.link_edit = QLineEdit(task.get("link") or "")
@@ -4697,7 +4734,7 @@ class ProjectTaskCardDialog(QDialog):
         layout.addLayout(btn_row)
 
     @staticmethod
-    def _build_date_row(layout, existing_value):
+    def _build_date_row(layout, existing_value, default_date: QDate):
         row = QHBoxLayout()
         check = QCheckBox("Set")
         row.addWidget(check)
@@ -4706,7 +4743,7 @@ class ProjectTaskCardDialog(QDialog):
         edit.setDisplayFormat("yyyy-MM-dd")
         existing = QDate.fromString(existing_value or "", "yyyy-MM-dd")
         check.setChecked(existing.isValid())
-        edit.setDate(existing if existing.isValid() else QDate.currentDate())
+        edit.setDate(existing if existing.isValid() else default_date)
         edit.setEnabled(existing.isValid())
         check.toggled.connect(edit.setEnabled)
         row.addWidget(edit, stretch=1)
@@ -4870,7 +4907,10 @@ class ProjectKanbanWidget(QWidget):
             QMessageBox.information(self, "No columns", "Add a column first.")
             return
         default_column_id = target_status or get_default_new_project_task_column(self.conn, self.board_id)
-        dialog = NewProjectTaskDialog(self._columns_cache, default_column_id, self)
+        default_start = default_project_task_start_date(self.conn, self.board_id)
+        dialog = NewProjectTaskDialog(
+            self._columns_cache, default_column_id, self, default_start_date=default_start
+        )
         if dialog.exec() != QDialog.Accepted:
             return
         values = dialog.result_values()
@@ -5006,7 +5046,16 @@ class _TableDateDelegate(QStyledItemDelegate):
     columns - a QDateEdit with a calendar popup, matching the date
     fields used everywhere else in the app (TaskCardDialog and friends).
     Editing only ever produces a valid date; clearing a date back to
-    unset still goes through the task dialog's "Set" checkbox."""
+    unset still goes through the task dialog's "Set" checkbox.
+
+    Needs a reference back to the owning view (rather than just conn) to
+    resolve the current board_id and to only apply the "default to right
+    after the last due date" behavior to the Start column - Due keeps
+    defaulting to today."""
+
+    def __init__(self, view, parent=None):
+        super().__init__(parent)
+        self.view = view
 
     def createEditor(self, parent, option, index):
         editor = QDateEdit(parent)
@@ -5016,7 +5065,12 @@ class _TableDateDelegate(QStyledItemDelegate):
 
     def setEditorData(self, editor, index) -> None:
         existing = QDate.fromString(index.data(Qt.EditRole) or "", "yyyy-MM-dd")
-        editor.setDate(existing if existing.isValid() else QDate.currentDate())
+        if existing.isValid():
+            editor.setDate(existing)
+        elif index.column() == self.view.COLUMN_START and self.view.board_id:
+            editor.setDate(default_project_task_start_date(self.view.conn, self.view.board_id))
+        else:
+            editor.setDate(QDate.currentDate())
 
     def setModelData(self, editor, model, index) -> None:
         model.setData(index, editor.date().toString("yyyy-MM-dd"), Qt.EditRole)
@@ -5053,7 +5107,7 @@ class _ProjectTaskTableView(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.setSortingEnabled(True)
-        self._date_delegate = _TableDateDelegate(self.table)
+        self._date_delegate = _TableDateDelegate(self, self.table)
         self.table.setItemDelegateForColumn(self.COLUMN_START, self._date_delegate)
         self.table.setItemDelegateForColumn(self.COLUMN_DUE, self._date_delegate)
         self.table.itemDoubleClicked.connect(self._on_row_double_clicked)
