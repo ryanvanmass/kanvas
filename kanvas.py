@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QDateEdit, QSpinBox, QMenu, QToolButton, QStackedWidget,
     QDateTimeEdit, QTimeEdit, QRadioButton, QButtonGroup, QSystemTrayIcon,
     QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea, QGridLayout, QSizePolicy,
+    QStyledItemDelegate,
 )
 
 APP_TITLE = "Kanvas"
@@ -5000,10 +5001,39 @@ class ProjectKanbanWidget(QWidget):
         self.rebuild_columns()
 
 
+class _TableDateDelegate(QStyledItemDelegate):
+    """Inline date editor for the List/Missing Dates tables' Start/Due
+    columns - a QDateEdit with a calendar popup, matching the date
+    fields used everywhere else in the app (TaskCardDialog and friends).
+    Editing only ever produces a valid date; clearing a date back to
+    unset still goes through the task dialog's "Set" checkbox."""
+
+    def createEditor(self, parent, option, index):
+        editor = QDateEdit(parent)
+        editor.setCalendarPopup(True)
+        editor.setDisplayFormat("yyyy-MM-dd")
+        return editor
+
+    def setEditorData(self, editor, index) -> None:
+        existing = QDate.fromString(index.data(Qt.EditRole) or "", "yyyy-MM-dd")
+        editor.setDate(existing if existing.isValid() else QDate.currentDate())
+
+    def setModelData(self, editor, model, index) -> None:
+        model.setData(index, editor.date().toString("yyyy-MM-dd"), Qt.EditRole)
+
+    def updateEditorGeometry(self, editor, option, index) -> None:
+        editor.setGeometry(option.rect)
+
+
 class _ProjectTaskTableView(QWidget):
     """Shared QTableWidget wrapper backing both the List and Missing Dates
     views - same columns, same sort/double-click behavior, only the task
-    query differs (see ProjectListView/ProjectMissingDatesView below)."""
+    query differs (see ProjectListView/ProjectMissingDatesView below).
+    Start/Due are editable in place (via _TableDateDelegate); every other
+    column stays read-only, opened through the full task dialog instead."""
+
+    COLUMN_START = 2
+    COLUMN_DUE = 3
 
     def __init__(self, conn: sqlite3.Connection, hub, parent=None):
         super().__init__(parent)
@@ -5019,11 +5049,15 @@ class _ProjectTaskTableView(QWidget):
         self.table.setHorizontalHeaderLabels(["Title", "Column", "Start", "Due", "Completed"])
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.setSortingEnabled(True)
+        self._date_delegate = _TableDateDelegate(self.table)
+        self.table.setItemDelegateForColumn(self.COLUMN_START, self._date_delegate)
+        self.table.setItemDelegateForColumn(self.COLUMN_DUE, self._date_delegate)
         self.table.itemDoubleClicked.connect(self._on_row_double_clicked)
+        self.table.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self.table)
 
     def load_board(self, board_id: str) -> None:
@@ -5042,21 +5076,49 @@ class _ProjectTaskTableView(QWidget):
         tasks = self._fetch_tasks()
 
         self.table.setSortingEnabled(False)
+        self.table.blockSignals(True)
         self.table.setRowCount(len(tasks))
         for row, task in enumerate(tasks):
             title_item = QTableWidgetItem(task["title"])
             title_item.setData(Qt.UserRole, task["id"])
+            title_item.setFlags(title_item.flags() & ~Qt.ItemIsEditable)
             self.table.setItem(row, 0, title_item)
-            self.table.setItem(row, 1, QTableWidgetItem(col_name_by_id.get(task["column_id"], "")))
-            self.table.setItem(row, 2, QTableWidgetItem(task.get("start_date") or ""))
-            self.table.setItem(row, 3, QTableWidgetItem(task.get("due_date") or ""))
-            self.table.setItem(row, 4, QTableWidgetItem("Yes" if task["completed"] else ""))
+
+            column_item = QTableWidgetItem(col_name_by_id.get(task["column_id"], ""))
+            column_item.setFlags(column_item.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(row, 1, column_item)
+
+            self.table.setItem(row, self.COLUMN_START, QTableWidgetItem(task.get("start_date") or ""))
+            self.table.setItem(row, self.COLUMN_DUE, QTableWidgetItem(task.get("due_date") or ""))
+
+            completed_item = QTableWidgetItem("Yes" if task["completed"] else "")
+            completed_item.setFlags(completed_item.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(row, 4, completed_item)
+        self.table.blockSignals(False)
         self.table.setSortingEnabled(True)
 
     def _on_row_double_clicked(self, item: QTableWidgetItem) -> None:
+        if item.column() in (self.COLUMN_START, self.COLUMN_DUE):
+            return  # edited in place instead of opening the task dialog
         table = item.tableWidget()
         task_id = table.item(item.row(), 0).data(Qt.UserRole)
         self.hub.kanban_widget.edit_task(task_id)
+
+    def _on_item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() not in (self.COLUMN_START, self.COLUMN_DUE):
+            return
+
+        title_item = self.table.item(item.row(), 0)
+        task_id = title_item.data(Qt.UserRole) if title_item else None
+        task = get_project_task(self.conn, task_id) if task_id else None
+        if task is None:
+            return
+
+        new_value = item.text().strip()
+        start_date = new_value if item.column() == self.COLUMN_START else (task.get("start_date") or "")
+        due_date = new_value if item.column() == self.COLUMN_DUE else (task.get("due_date") or "")
+        update_project_task(self.conn, task_id, task["title"], task["notes"], start_date, due_date, task["link"])
+        self.hub.refresh_all_views()
 
 
 class ProjectListView(_ProjectTaskTableView):
