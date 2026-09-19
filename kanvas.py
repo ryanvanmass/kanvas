@@ -5077,9 +5077,13 @@ class ProjectMissingDatesView(_ProjectTaskTableView):
 
 class ProjectGanttChart(QWidget):
     """The painted canvas half of the Gantt view: one horizontal bar per
-    scheduled task (both start_date and due_date set), grouped into
-    swimlanes by column. No dependency arrows - project_tasks has no
-    dependency field, matching the issue's "No dependency arrows in v1".
+    scheduled task (both start_date and due_date set), all tasks shown
+    together in one flat, chronologically-ordered list rather than
+    grouped by column - bars are still tinted by column (see
+    project_column_color) so status stays visible at a glance without a
+    separate swimlane per column. No dependency arrows - project_tasks
+    has no dependency field, matching the issue's "No dependency arrows
+    in v1".
 
     This is the only custom-painted widget in the app; everywhere else
     is built from standard Qt widgets/layouts. A free date axis with
@@ -5090,8 +5094,6 @@ class ProjectGanttChart(QWidget):
     DAY_WIDTH = 24
     ROW_HEIGHT = 32
     ROW_VPAD = 6
-    LANE_HEADER_HEIGHT = 28
-    SWIMLANE_GAP = 12
     DATE_RULER_HEIGHT = 24
     LEFT_MARGIN = 12
     PADDING_DAYS = 3
@@ -5103,8 +5105,8 @@ class ProjectGanttChart(QWidget):
         super().__init__(parent)
         self.conn = conn
         self.board_id = None
-        self._columns = []
-        self._tasks_by_column = {}
+        self._tasks = []
+        self._column_position_by_id = {}
         self._range_start = None
         self._range_end = None
         self._task_rects = []  # [(QRect, task_id), ...] - rebuilt each paint
@@ -5122,13 +5124,14 @@ class ProjectGanttChart(QWidget):
         return self._range_start is not None
 
     def _recompute_layout(self) -> None:
-        self._columns = get_project_columns(self.conn, self.board_id) if self.board_id else []
+        columns = get_project_columns(self.conn, self.board_id) if self.board_id else []
+        self._column_position_by_id = {c["id"]: c["position"] for c in columns}
         scheduled = get_scheduled_project_tasks(self.conn, self.board_id) if self.board_id else []
 
         if not scheduled:
             self._range_start = None
             self._range_end = None
-            self._tasks_by_column = {}
+            self._tasks = []
             self.setFixedSize(1, 1)
             return
 
@@ -5136,19 +5139,11 @@ class ProjectGanttChart(QWidget):
         dues = [QDate.fromString(t["due_date"], "yyyy-MM-dd") for t in scheduled]
         self._range_start = min(starts).addDays(-self.PADDING_DAYS)
         self._range_end = max(dues).addDays(self.PADDING_DAYS)
-
-        self._tasks_by_column = {c["id"]: [] for c in self._columns}
-        for task in scheduled:
-            self._tasks_by_column.setdefault(task["column_id"], []).append(task)
+        self._tasks = scheduled  # flat - already ORDER BY start_date, position
 
         total_days = self._range_start.daysTo(self._range_end) + 1
         width = self.LEFT_MARGIN * 2 + total_days * self.DAY_WIDTH
-
-        height = self.DATE_RULER_HEIGHT
-        for col in self._columns:
-            row_count = max(1, len(self._tasks_by_column.get(col["id"], [])))
-            height += self.LANE_HEADER_HEIGHT + row_count * self.ROW_HEIGHT + self.SWIMLANE_GAP
-
+        height = self.DATE_RULER_HEIGHT + len(self._tasks) * self.ROW_HEIGHT
         self.setFixedSize(max(width, 1), max(height, 1))
 
     def _x_for_date(self, d: QDate) -> int:
@@ -5173,39 +5168,19 @@ class ProjectGanttChart(QWidget):
             d = d.addDays(1)
 
         y = self.DATE_RULER_HEIGHT
-        for col in self._columns:
-            tasks = self._tasks_by_column.get(col["id"], [])
-            row_count = max(1, len(tasks))
-            group_height = self.LANE_HEADER_HEIGHT + row_count * self.ROW_HEIGHT
-
-            header_rect = QRect(0, y, self.width(), self.LANE_HEADER_HEIGHT)
-            painter.fillRect(header_rect, QColor("#232427"))
-            painter.setPen(QColor("#e8e8e8"))
-            painter.drawText(header_rect.adjusted(self.LEFT_MARGIN, 0, 0, 0), Qt.AlignVCenter, col["name"])
-
-            row_top = y + self.LANE_HEADER_HEIGHT
-            if not tasks:
-                painter.setPen(QColor("#6e6e6e"))
-                painter.drawText(
-                    QRect(self.LEFT_MARGIN, row_top, self.width(), self.ROW_HEIGHT),
-                    Qt.AlignVCenter, "No scheduled tasks",
-                )
-            else:
-                bar_color = QColor(project_column_color(col["position"]))
-                for i, task in enumerate(tasks):
-                    start = QDate.fromString(task["start_date"], "yyyy-MM-dd")
-                    due = QDate.fromString(task["due_date"], "yyyy-MM-dd")
-                    x1 = self._x_for_date(start)
-                    x2 = self._x_for_date(due) + self.DAY_WIDTH
-                    bar_y = row_top + i * self.ROW_HEIGHT + self.ROW_VPAD // 2
-                    bar_h = self.ROW_HEIGHT - self.ROW_VPAD
-                    rect = QRect(x1, bar_y, max(x2 - x1, 4), bar_h)
-                    painter.fillRect(rect, bar_color)
-                    painter.setPen(QColor("#ffffff"))
-                    painter.drawText(rect.adjusted(4, 0, -4, 0), Qt.AlignVCenter, task["title"])
-                    self._task_rects.append((rect, task["id"]))
-
-            y += group_height + self.SWIMLANE_GAP
+        for i, task in enumerate(self._tasks):
+            start = QDate.fromString(task["start_date"], "yyyy-MM-dd")
+            due = QDate.fromString(task["due_date"], "yyyy-MM-dd")
+            x1 = self._x_for_date(start)
+            x2 = self._x_for_date(due) + self.DAY_WIDTH
+            bar_y = y + i * self.ROW_HEIGHT + self.ROW_VPAD // 2
+            bar_h = self.ROW_HEIGHT - self.ROW_VPAD
+            rect = QRect(x1, bar_y, max(x2 - x1, 4), bar_h)
+            bar_color = QColor(project_column_color(self._column_position_by_id.get(task["column_id"], 0)))
+            painter.fillRect(rect, bar_color)
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(rect.adjusted(4, 0, -4, 0), Qt.AlignVCenter, task["title"])
+            self._task_rects.append((rect, task["id"]))
 
         today = QDate.currentDate()
         if self._range_start <= today <= self._range_end:
