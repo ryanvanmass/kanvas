@@ -5798,15 +5798,17 @@ class ProjectsHub(QWidget):
         self.breadcrumb.crumb_clicked.connect(self.navigate_to_board)
         toolbar.addWidget(self.breadcrumb, stretch=1)
 
-        self.add_task_btn = QPushButton("+ New Task")
+        self.add_task_btn = QToolButton()
+        self.add_task_btn.setText("+ New Task")
+        self.add_task_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.add_task_btn.setProperty("accent", True)
+        self.add_task_btn.setPopupMode(QToolButton.MenuButtonPopup)
         self.add_task_btn.clicked.connect(lambda: self.kanban_widget.add_task())
+        self.new_task_menu = QMenu(self.add_task_btn)
+        add_multiple_action = self.new_task_menu.addAction("Add Multiple…")
+        add_multiple_action.triggered.connect(lambda: self.kanban_widget.add_multiple_tasks_ui())
+        self.add_task_btn.setMenu(self.new_task_menu)
         toolbar.addWidget(self.add_task_btn)
-
-        self.add_multiple_btn = QPushButton("+ Add Multiple")
-        self.add_multiple_btn.setToolTip("Add several tasks at once, one per line")
-        self.add_multiple_btn.clicked.connect(lambda: self.kanban_widget.add_multiple_tasks_ui())
-        toolbar.addWidget(self.add_multiple_btn)
 
         self.add_col_btn = QPushButton("+ Column")
         self.add_col_btn.clicked.connect(lambda: self.kanban_widget.add_column_ui())
