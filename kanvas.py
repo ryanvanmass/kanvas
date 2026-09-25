@@ -3646,6 +3646,13 @@ class BoardSidePanel(QWidget):
             item = self.boards_list_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                # hide() first: takeAt() stops the layout from managing
+                # the widget, but doesn't hide it - left alone, it stays
+                # visibly painted at its last position until deleteLater()
+                # actually runs, which isn't guaranteed before the next
+                # repaint (seen as literal ghost duplicate cells in the
+                # Calendar view under fast navigation).
+                widget.hide()
                 widget.deleteLater()
 
         for b in boards:
@@ -3730,6 +3737,13 @@ class BoardSidePanel(QWidget):
             item = self.projects_list_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                # hide() first: takeAt() stops the layout from managing
+                # the widget, but doesn't hide it - left alone, it stays
+                # visibly painted at its last position until deleteLater()
+                # actually runs, which isn't guaranteed before the next
+                # repaint (seen as literal ghost duplicate cells in the
+                # Calendar view under fast navigation).
+                widget.hide()
                 widget.deleteLater()
 
         flat_btn_qss = (
@@ -4022,6 +4036,13 @@ class KanbanBoard(QWidget):
             item = self.columns_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                # hide() first: takeAt() stops the layout from managing
+                # the widget, but doesn't hide it - left alone, it stays
+                # visibly painted at its last position until deleteLater()
+                # actually runs, which isn't guaranteed before the next
+                # repaint (seen as literal ghost duplicate cells in the
+                # Calendar view under fast navigation).
+                widget.hide()
                 widget.deleteLater()
 
         self.columns = {}
@@ -4484,6 +4505,13 @@ class BreadcrumbBar(QWidget):
             item = self._row.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                # hide() first: takeAt() stops the layout from managing
+                # the widget, but doesn't hide it - left alone, it stays
+                # visibly painted at its last position until deleteLater()
+                # actually runs, which isn't guaranteed before the next
+                # repaint (seen as literal ghost duplicate cells in the
+                # Calendar view under fast navigation).
+                widget.hide()
                 widget.deleteLater()
 
         crumbs = self._crumbs
@@ -4952,6 +4980,13 @@ class ProjectKanbanWidget(QWidget):
             item = self.columns_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                # hide() first: takeAt() stops the layout from managing
+                # the widget, but doesn't hide it - left alone, it stays
+                # visibly painted at its last position until deleteLater()
+                # actually runs, which isn't guaranteed before the next
+                # repaint (seen as literal ghost duplicate cells in the
+                # Calendar view under fast navigation).
+                widget.hide()
                 widget.deleteLater()
 
         self.columns = {}
@@ -5659,6 +5694,13 @@ class ProjectCalendarView(QWidget):
             item = self.grid.takeAt(self.grid.count() - 1)
             widget = item.widget()
             if widget is not None:
+                # hide() first: takeAt() stops the layout from managing
+                # the widget, but doesn't hide it - left alone, it stays
+                # visibly painted at its last position until deleteLater()
+                # actually runs, which isn't guaranteed before the next
+                # repaint (seen as literal ghost duplicate cells in the
+                # Calendar view under fast navigation).
+                widget.hide()
                 widget.deleteLater()
 
     def _build_week_row(self, week: list, tasks: list, task_ranges: dict, grid_row: int, current_month) -> int:
