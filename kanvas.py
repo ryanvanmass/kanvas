@@ -33,7 +33,7 @@ import platform
 import threading
 from datetime import datetime, date, timedelta, time as dt_time
 
-from PySide6.QtCore import Qt, QRect, QDate, QTime, QDateTime, QTimer, QObject, Signal, QPropertyAnimation, QEasingCurve
+from PySide6.QtCore import Qt, QRect, QPoint, QDate, QTime, QDateTime, QTimer, QObject, Signal, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import QIcon, QAction, QFont, QColor, QCursor, QPainter, QPen, QBrush, QFontMetrics
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -5437,13 +5437,28 @@ class ProjectGanttChart(QWidget):
             painter.end()
             return
 
-        # Date ruler: a tick + short label every 7 days across the range.
+        # Today marker's label rect, computed up front so the date-ruler
+        # loop below can skip any tick label that would collide with it
+        # (rather than painting one over the other and losing either).
+        today = QDate.currentDate()
+        today_x = None
+        today_label_rect = None
+        if self._range_start <= today <= self._range_end:
+            today_x = self._x_for_date(today) + self.DAY_WIDTH // 2
+            label_metrics = painter.fontMetrics()
+            today_label_rect = label_metrics.boundingRect("Today").adjusted(-2, -1, 2, 1)
+            today_label_rect.moveTopLeft(QPoint(today_x + 3, 2))
+
+        # Date ruler: a tick + short label every 7 days across the range,
+        # skipping any label that would collide with the Today label.
         painter.setPen(QColor("#9a9a9a"))
         d = self._range_start
         while d <= self._range_end:
             if self._range_start.daysTo(d) % 7 == 0:
                 x = self._x_for_date(d)
-                painter.drawText(x + 2, self.DATE_RULER_HEIGHT - 8, d.toString("MMM d"))
+                tick_label_rect = QRect(x + 2, 0, painter.fontMetrics().horizontalAdvance(d.toString("MMM d")), self.DATE_RULER_HEIGHT)
+                if today_label_rect is None or not tick_label_rect.intersects(today_label_rect):
+                    painter.drawText(x + 2, self.DATE_RULER_HEIGHT - 8, d.toString("MMM d"))
                 painter.drawLine(x, self.DATE_RULER_HEIGHT - 4, x, self.height())
             d = d.addDays(1)
 
@@ -5459,16 +5474,22 @@ class ProjectGanttChart(QWidget):
             bar_color = QColor(project_column_color(self._column_position_by_id.get(task["column_id"], 0)))
             painter.fillRect(rect, bar_color)
             painter.setPen(QColor("#ffffff"))
-            painter.drawText(rect.adjusted(4, 0, -4, 0), Qt.AlignVCenter, task["title"])
+            text_rect = rect.adjusted(4, 0, -4, 0)
+            elided_title = painter.fontMetrics().elidedText(task["title"], Qt.ElideRight, text_rect.width())
+            painter.drawText(text_rect, Qt.AlignVCenter, elided_title)
             self._task_rects.append((rect, task["id"]))
 
-        today = QDate.currentDate()
-        if self._range_start <= today <= self._range_end:
-            x = self._x_for_date(today) + self.DAY_WIDTH // 2
+        if today_x is not None:
             painter.setPen(QPen(QColor(self.TODAY_MARKER_COLOR), 1, Qt.DashLine))
-            painter.drawLine(x, 0, x, self.height())
+            painter.drawLine(today_x, 0, today_x, self.height())
+
+            # Opaque backdrop behind the label too, as a second line of
+            # defense on top of the ruler already yielding its own label
+            # above - e.g. if a task bar's text were ever tall enough to
+            # reach this band.
+            painter.fillRect(today_label_rect, QColor("#1b1c1e"))
             painter.setPen(QColor(self.TODAY_MARKER_COLOR))
-            painter.drawText(x + 3, 12, "Today")
+            painter.drawText(today_label_rect, Qt.AlignCenter, "Today")
 
         painter.end()
 
