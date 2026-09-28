@@ -1382,13 +1382,19 @@ def delete_project(conn: sqlite3.Connection, project_id: str) -> None:
     _compact_project_positions(conn)
 
 
-# -- Document Library (flat, project-wide list of file/URL references;    --
-# -- not attached to any task or board - see issue #2 §8) -----------------
+# -- Document Library (flat, project-wide list of file/folder/URL         --
+# -- references; not attached to any task or board - see issue #2 §8;     --
+# -- 'folder' extends the file/URL kinds from the original spec) ----------
 
 PROJECT_DOCUMENT_KINDS = [
     ("file", "Local File"),
+    ("folder", "Folder"),
     ("url", "URL"),
 ]
+
+# Kinds backed by a local filesystem path rather than a URL - opened via
+# QUrl.fromLocalFile() instead of being passed straight to QUrl().
+PROJECT_DOCUMENT_LOCAL_KINDS = ("file", "folder")
 
 
 def get_project_documents(conn: sqlite3.Connection, project_id: str, search_text: str = "") -> list:
@@ -5048,12 +5054,13 @@ class BulkAddProjectTasksDialog(QDialog):
 
 
 class AddDocumentDialog(QDialog):
-    """Add-entry dialog for the Document Library (issue §8.2): a Local
-    File / URL toggle, then either a native file-picker or a plain text
-    field for the path/URL, a required Label, and optional Notes. No
-    validation beyond non-empty label/path-or-url - a broken path or
-    malformed URL is accepted, since opening it fails gracefully later
-    rather than being pre-flighted here (§8.1)."""
+    """Add-entry dialog for the Document Library (issue §8.2, extended
+    with a Folder kind alongside File/URL): a three-way toggle, then
+    either a native file/folder picker or a plain text field for the
+    path/URL, a required Label, and optional Notes. No validation beyond
+    non-empty label/path-or-url - a broken path or malformed URL is
+    accepted, since opening it fails gracefully later rather than being
+    pre-flighted here (§8.1)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -5064,13 +5071,22 @@ class AddDocumentDialog(QDialog):
 
         kind_row = QHBoxLayout()
         self.file_radio = QRadioButton("Local File")
+        self.folder_radio = QRadioButton("Folder")
         self.url_radio = QRadioButton("URL")
         self.file_radio.setChecked(True)
         kind_group = QButtonGroup(self)
         kind_group.addButton(self.file_radio)
+        kind_group.addButton(self.folder_radio)
         kind_group.addButton(self.url_radio)
+        # Connect every button's own toggled signal, not just one - with a
+        # 3-way exclusive group, a click can switch between the two buttons
+        # that AREN'T this one, so no single button's toggled signal covers
+        # every transition.
         self.file_radio.toggled.connect(self._on_kind_toggled)
+        self.folder_radio.toggled.connect(self._on_kind_toggled)
+        self.url_radio.toggled.connect(self._on_kind_toggled)
         kind_row.addWidget(self.file_radio)
+        kind_row.addWidget(self.folder_radio)
         kind_row.addWidget(self.url_radio)
         kind_row.addStretch()
         layout.addLayout(kind_row)
@@ -5110,14 +5126,24 @@ class AddDocumentDialog(QDialog):
         self.label_edit.textEdited.connect(lambda: setattr(self, "_label_user_edited", True))
         self._on_kind_toggled(True)
 
+    def _selected_kind(self) -> str:
+        if self.file_radio.isChecked():
+            return "file"
+        if self.folder_radio.isChecked():
+            return "folder"
+        return "url"
+
     def _on_kind_toggled(self, _checked: bool) -> None:
-        is_file = self.file_radio.isChecked()
-        self.browse_btn.setVisible(is_file)
-        self.path_edit.setPlaceholderText("Choose a file..." if is_file else "https://...")
-        self.path_edit.setReadOnly(False)
+        kind = self._selected_kind()
+        self.browse_btn.setVisible(kind in ("file", "folder"))
+        placeholder = {"file": "Choose a file...", "folder": "Choose a folder...", "url": "https://..."}
+        self.path_edit.setPlaceholderText(placeholder[kind])
 
     def _on_browse(self) -> None:
-        path, _filter = QFileDialog.getOpenFileName(self, "Choose a file")
+        if self.folder_radio.isChecked():
+            path = QFileDialog.getExistingDirectory(self, "Choose a folder")
+        else:
+            path, _filter = QFileDialog.getOpenFileName(self, "Choose a file")
         if path:
             self.path_edit.setText(path)
 
@@ -5126,12 +5152,13 @@ class AddDocumentDialog(QDialog):
         # types their own - mirrors how templates pre-fill titles elsewhere.
         if self._label_user_edited:
             return
-        base = os.path.basename(text.rstrip("/")) if self.file_radio.isChecked() else text
+        is_local = self._selected_kind() in ("file", "folder")
+        base = os.path.basename(text.rstrip("/")) if is_local else text
         self.label_edit.setText(base)
 
     def _on_add(self) -> None:
         if not self.path_edit.text().strip():
-            kind_word = "file" if self.file_radio.isChecked() else "URL"
+            kind_word = {"file": "file", "folder": "folder", "url": "URL"}[self._selected_kind()]
             QMessageBox.warning(self, "Required", f"Choose a {kind_word}.")
             return
         if not self.label_edit.text().strip():
@@ -5141,7 +5168,7 @@ class AddDocumentDialog(QDialog):
 
     def result_values(self) -> dict:
         return {
-            "kind": "file" if self.file_radio.isChecked() else "url",
+            "kind": self._selected_kind(),
             "path_or_url": self.path_edit.text().strip(),
             "label": self.label_edit.text().strip(),
             "notes": self.notes_edit.toPlainText().strip(),
@@ -6405,10 +6432,10 @@ class ProjectActivityLogView(QWidget):
 
 class ProjectDocumentLibraryView(QWidget):
     """Project-wide Document Library screen (issue §8.3) - a flat,
-    reorderable list of file/URL references, not attached to any task or
-    board. Opening an entry hands off to the OS (default file handler or
-    browser) and reports failure gracefully rather than pre-checking that
-    the path/URL is still valid (§8.1)."""
+    reorderable list of file/folder/URL references, not attached to any
+    task or board. Opening an entry hands off to the OS (default file
+    handler or browser) and reports failure gracefully rather than
+    pre-checking that the path/URL is still valid (§8.1)."""
 
     COLUMN_KIND = 0
     COLUMN_LABEL = 1
@@ -6506,11 +6533,13 @@ class ProjectDocumentLibraryView(QWidget):
         if doc is None:
             return
 
-        url = QUrl.fromLocalFile(doc["path_or_url"]) if doc["kind"] == "file" else QUrl(doc["path_or_url"])
+        is_local = doc["kind"] in PROJECT_DOCUMENT_LOCAL_KINDS
+        url = QUrl.fromLocalFile(doc["path_or_url"]) if is_local else QUrl(doc["path_or_url"])
         if not QDesktopServices.openUrl(url):
+            noun = "folder" if doc["kind"] == "folder" else "file"
             QMessageBox.warning(
                 self, "Couldn't open",
-                "Couldn't open - the file may have moved or been deleted." if doc["kind"] == "file"
+                f"Couldn't open - the {noun} may have moved or been deleted." if is_local
                 else "Couldn't open that URL.",
             )
 
