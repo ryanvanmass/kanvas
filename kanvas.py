@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QDateEdit, QSpinBox, QMenu, QToolButton, QStackedWidget,
     QDateTimeEdit, QTimeEdit, QRadioButton, QButtonGroup, QSystemTrayIcon,
     QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea, QGridLayout, QSizePolicy,
-    QStyledItemDelegate, QTabWidget, QFileDialog,
+    QStyledItemDelegate, QTabWidget, QFileDialog, QProgressBar,
 )
 
 APP_TITLE = "Kanvas"
@@ -1652,6 +1652,85 @@ def get_subtree_task_progress(conn: sqlite3.Connection, root_board_id: str) -> t
     return done, total
 
 
+def clone_board_subtree(
+    conn: sqlite3.Connection, source_board_id: str, target_project_id: str,
+    parent_task_id, name: str = None,
+) -> dict:
+    """Recursively clones a board - its columns, starter tasks, and any
+    sub-boards owned by those tasks - into target_project_id. Only title/
+    notes/link are copied onto each cloned task, not start/due dates,
+    completed status, or subtasks: a clone is meant to seed fresh work,
+    not replay one project's specific schedule or progress. Columns are
+    copied by name/order rather than falling back to
+    add_project_board()'s default starter set, so the clone matches the
+    source board exactly.
+
+    parent_task_id=None makes a Main Board (same convention as
+    add_project_board() itself) - this is the "walk/clone this subtree"
+    primitive issue #2 §7 calls for, the templating counterpart to the
+    recursive badge counts (§5) and get_project_rollup() (§6) below."""
+    source_board = get_project_board(conn, source_board_id)
+    if source_board is None:
+        raise ValueError("That board no longer exists.")
+
+    new_board = add_project_board(
+        conn, target_project_id, parent_task_id, name or source_board["name"], seed_default_columns=False,
+    )
+
+    column_id_map = {}
+    for col in get_project_columns(conn, source_board_id):
+        new_col = add_project_column(conn, new_board["id"], col["name"])
+        column_id_map[col["id"]] = new_col["id"]
+
+    for task in get_project_tasks_for_board(conn, source_board_id):
+        new_column_id = column_id_map.get(task["column_id"])
+        if new_column_id is None:
+            continue
+        new_task = add_project_task(
+            conn, new_board["id"], new_column_id, task["title"],
+            notes=task.get("notes") or "", link=task.get("link") or "",
+        )
+        source_subboard = get_subboard_for_task(conn, task["id"])
+        if source_subboard is not None:
+            clone_board_subtree(conn, source_subboard["id"], target_project_id, new_task["id"])
+
+    return new_board
+
+
+def duplicate_project(conn: sqlite3.Connection, project_id: str, new_name: str = None) -> dict:
+    """Clones a whole project - its Main Board and everything below it,
+    via clone_board_subtree() - into a brand-new project (issue #2 §7's
+    "templating a whole project"). The clone starts with an empty
+    Document Library and Activity Log (only the "created" entries its own
+    cloned tasks generate) rather than copying the source's - §7 leaves
+    this as an open question, and starting fresh is the more sensible
+    default since another project's history/documents wouldn't describe
+    the new one."""
+    source = get_project(conn, project_id)
+    if source is None or not source.get("main_board_id"):
+        raise ValueError("That project no longer exists.")
+
+    name = (new_name or f'{source["name"]} (Copy)').strip()
+    if not name:
+        raise ValueError("Project name cannot be empty.")
+
+    max_position_row = conn.execute("SELECT MAX(position) AS m FROM projects").fetchone()
+    next_position = (max_position_row["m"] + 1) if max_position_row["m"] is not None else 0
+
+    new_project_id = uuid.uuid4().hex
+    conn.execute(
+        "INSERT INTO projects (id, name, position, created_at, main_board_id) VALUES (?, ?, ?, ?, NULL)",
+        (new_project_id, name, next_position, _now()),
+    )
+    conn.commit()
+
+    new_main_board = clone_board_subtree(conn, source["main_board_id"], new_project_id, None, name=name)
+    conn.execute("UPDATE projects SET main_board_id = ? WHERE id = ?", (new_main_board["id"], new_project_id))
+    conn.commit()
+
+    return get_project(conn, new_project_id)
+
+
 def delete_project_board(conn: sqlite3.Connection, board_id: str) -> None:
     """Deletes a board along with its columns/tasks/subtasks, and
     (recursively, via get_board_subtree_ids) any sub-boards spawned from
@@ -2065,6 +2144,40 @@ def get_project_task_count(conn: sqlite3.Connection, project_id: str) -> int:
     if project is None or not project.get("main_board_id"):
         return 0
     return get_subtree_counts(conn, project["main_board_id"])["task_count"]
+
+
+def get_project_rollup(conn: sqlite3.Connection, project_id: str) -> dict:
+    """Project-level progress rollup (issue #2 §6): {"done", "total",
+    "boards": [{"board_id", "path", "done", "total"}, ...]}. "done"/
+    "total" here are the aggregate across the whole board tree
+    (get_subtree_task_progress on the Main Board); each row in "boards"
+    counts only that board's own direct tasks, so the rows sum to the
+    aggregate rather than double-counting a board and its descendants.
+    Deliberately a separate, dedicated summary rather than flattening
+    sub-board tasks into the Main Board's own Kanban/List/Gantt/Calendar,
+    which stay scoped to one board at a time per §6."""
+    project = get_project(conn, project_id)
+    if project is None or not project.get("main_board_id"):
+        return {"done": 0, "total": 0, "boards": []}
+
+    main_board_id = project["main_board_id"]
+    done, total = get_subtree_task_progress(conn, main_board_id)
+
+    boards = []
+    for board_id in get_board_subtree_ids(conn, main_board_id):
+        board = get_project_board(conn, board_id)
+        if board is None:
+            continue
+        b_total = conn.execute(
+            "SELECT COUNT(*) AS c FROM project_tasks WHERE board_id = ?", (board_id,)
+        ).fetchone()["c"]
+        b_done = conn.execute(
+            "SELECT COUNT(*) AS c FROM project_tasks WHERE board_id = ? AND completed = 1", (board_id,)
+        ).fetchone()["c"]
+        path = " › ".join(c["label"] for c in get_board_breadcrumb(conn, board_id))
+        boards.append({"board_id": board_id, "path": path, "done": b_done, "total": b_total})
+
+    return {"done": done, "total": total, "boards": boards}
 
 
 # -- Activity Log (permanent audit trail of task-lifecycle events) -------
@@ -4100,12 +4213,14 @@ class BoardSidePanel(QWidget):
                 move_up = menu.addAction("Move Up")
                 move_down = menu.addAction("Move Down")
                 rename = menu.addAction("Rename")
+                duplicate = menu.addAction("Duplicate")
                 menu.addSeparator()
                 delete = menu.addAction("Delete")
 
                 move_up.triggered.connect(lambda: self.board.move_project_ui(project_id, -1))
                 move_down.triggered.connect(lambda: self.board.move_project_ui(project_id, 1))
                 rename.triggered.connect(lambda: self.board.rename_project_ui(project_id))
+                duplicate.triggered.connect(lambda: self.board.duplicate_project_ui(project_id))
                 delete.triggered.connect(lambda: self.board.delete_project_ui(project_id))
 
                 menu.exec(anchor_btn.mapToGlobal(anchor_btn.rect().bottomLeft()))
@@ -4709,6 +4824,26 @@ class KanbanBoard(QWidget):
             return
         self.rebuild_projects_cache()
         self._sync_board_panel()
+
+    def duplicate_project_ui(self, project_id: str) -> None:
+        """Whole-project templating action (issue #2 §7): clones the
+        project's Main Board and its entire sub-board tree into a new
+        project via duplicate_project()."""
+        project = get_project(self.conn, project_id)
+        if not project:
+            return
+        default_name = f'{project["name"]} (Copy)'
+        name, ok = QInputDialog.getText(self, "Duplicate Project", "New project name:", text=default_name)
+        if not ok or not name.strip():
+            return
+        try:
+            new_project = duplicate_project(self.conn, project_id, name.strip())
+        except ValueError as e:
+            QMessageBox.warning(self, "Could not duplicate project", str(e))
+            return
+        self.rebuild_projects_cache()
+        self._sync_board_panel()
+        self.select_project_from_panel(new_project["id"])
 
     def delete_project_ui(self, project_id: str) -> None:
         project = get_project(self.conn, project_id)
@@ -6571,6 +6706,73 @@ class ProjectDocumentLibraryView(QWidget):
         self.refresh()
 
 
+class ProjectRollupView(QWidget):
+    """Project-wide progress rollup screen (issue §6) - an aggregate
+    completion count across the whole board tree, plus a per-board
+    breakdown, backed by get_project_rollup(). Deliberately separate from
+    the per-board Kanban/List/Gantt/Calendar views, which stay scoped to
+    one board at a time (§6 explicitly keeps sub-board tasks from being
+    flattened into the Main Board's own views)."""
+
+    COLUMN_BOARD = 0
+    COLUMN_DONE = 1
+    COLUMN_TOTAL = 2
+    COLUMN_PERCENT = 3
+
+    def __init__(self, conn: sqlite3.Connection, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.project_id = None
+
+        outer = QVBoxLayout(self)
+
+        self.summary_label = QLabel()
+        self.summary_label.setStyleSheet("font-size: 16px; font-weight: 600;")
+        outer.addWidget(self.summary_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setTextVisible(True)
+        outer.addWidget(self.progress_bar)
+
+        outer.addWidget(QLabel("By board"))
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Board", "Done", "Total", "% Complete"])
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(self.COLUMN_BOARD, QHeaderView.Stretch)
+        outer.addWidget(self.table, stretch=1)
+
+    def load_project(self, project_id: str) -> None:
+        self.project_id = project_id
+        self.refresh()
+
+    def refresh(self) -> None:
+        if not self.project_id:
+            self.summary_label.setText("")
+            self.progress_bar.setValue(0)
+            self.table.setRowCount(0)
+            return
+
+        rollup = get_project_rollup(self.conn, self.project_id)
+        done, total = rollup["done"], rollup["total"]
+        percent = round(100 * done / total) if total else 0
+
+        self.summary_label.setText(f"{done} / {total} tasks complete ({percent}%)" if total else "No tasks yet")
+        self.progress_bar.setValue(percent)
+
+        boards = rollup["boards"]
+        self.table.setRowCount(len(boards))
+        for row, b in enumerate(boards):
+            b_percent = round(100 * b["done"] / b["total"]) if b["total"] else 0
+            self.table.setItem(row, self.COLUMN_BOARD, QTableWidgetItem(b["path"]))
+            self.table.setItem(row, self.COLUMN_DONE, QTableWidgetItem(str(b["done"])))
+            self.table.setItem(row, self.COLUMN_TOTAL, QTableWidgetItem(str(b["total"])))
+            self.table.setItem(row, self.COLUMN_PERCENT, QTableWidgetItem(f"{b_percent}%"))
+
+
 class ProjectsHub(QWidget):
     """The Projects page of the app's central QStackedWidget (see main()).
     Owns all Projects UI state - current project/board, the breadcrumb,
@@ -6658,6 +6860,11 @@ class ProjectsHub(QWidget):
         self.document_library_btn.clicked.connect(self.show_document_library)
         toolbar.addWidget(self.document_library_btn)
 
+        self.rollup_btn = QPushButton("Rollup")
+        self.rollup_btn.setToolTip("View project-wide progress, across every board")
+        self.rollup_btn.clicked.connect(self.show_rollup)
+        toolbar.addWidget(self.rollup_btn)
+
         board_page_layout.addLayout(toolbar)
 
         view_row = QHBoxLayout()
@@ -6712,10 +6919,23 @@ class ProjectsHub(QWidget):
         self.document_library_view = ProjectDocumentLibraryView(conn, self)
         document_library_page_layout.addWidget(self.document_library_view, stretch=1)
 
+        self.rollup_page = QWidget()
+        rollup_page_layout = QVBoxLayout(self.rollup_page)
+        rollup_page_layout.setContentsMargins(0, 0, 0, 0)
+        rollup_back_row = QHBoxLayout()
+        rollup_back_btn = QPushButton("← Back to Board")
+        rollup_back_btn.clicked.connect(self.show_board_page)
+        rollup_back_row.addWidget(rollup_back_btn)
+        rollup_back_row.addStretch()
+        rollup_page_layout.addLayout(rollup_back_row)
+        self.rollup_view = ProjectRollupView(conn, self)
+        rollup_page_layout.addWidget(self.rollup_view, stretch=1)
+
         self.page_stack = QStackedWidget()
         self.page_stack.addWidget(self.board_page)              # index 0
         self.page_stack.addWidget(self.activity_log_page)       # index 1
         self.page_stack.addWidget(self.document_library_page)   # index 2
+        self.page_stack.addWidget(self.rollup_page)              # index 3
         outer.addWidget(self.page_stack, stretch=1)
 
     # -- navigation --------------------------------------------------------
@@ -6764,6 +6984,8 @@ class ProjectsHub(QWidget):
         self.calendar_view.refresh()
         if self.page_stack.currentWidget() is self.activity_log_page:
             self.activity_log_view.refresh()
+        elif self.page_stack.currentWidget() is self.rollup_page:
+            self.rollup_view.refresh()
 
     def show_activity_log(self) -> None:
         if not self.current_project_id:
@@ -6776,6 +6998,12 @@ class ProjectsHub(QWidget):
             return
         self.document_library_view.load_project(self.current_project_id)
         self.page_stack.setCurrentWidget(self.document_library_page)
+
+    def show_rollup(self) -> None:
+        if not self.current_project_id:
+            return
+        self.rollup_view.load_project(self.current_project_id)
+        self.page_stack.setCurrentWidget(self.rollup_page)
 
     def show_board_page(self) -> None:
         self.page_stack.setCurrentWidget(self.board_page)
