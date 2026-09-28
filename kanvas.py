@@ -33,8 +33,8 @@ import platform
 import threading
 from datetime import datetime, date, timedelta, time as dt_time
 
-from PySide6.QtCore import Qt, QRect, QPoint, QDate, QTime, QDateTime, QTimer, QObject, Signal, QPropertyAnimation, QEasingCurve
-from PySide6.QtGui import QIcon, QAction, QFont, QColor, QCursor, QPainter, QPen, QBrush, QFontMetrics
+from PySide6.QtCore import Qt, QRect, QPoint, QDate, QTime, QDateTime, QTimer, QObject, Signal, QPropertyAnimation, QEasingCurve, QUrl
+from PySide6.QtGui import QIcon, QAction, QFont, QColor, QCursor, QPainter, QPen, QBrush, QFontMetrics, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QListView, QComboBox,
@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QDateEdit, QSpinBox, QMenu, QToolButton, QStackedWidget,
     QDateTimeEdit, QTimeEdit, QRadioButton, QButtonGroup, QSystemTrayIcon,
     QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea, QGridLayout, QSizePolicy,
-    QStyledItemDelegate, QTabWidget,
+    QStyledItemDelegate, QTabWidget, QFileDialog,
 )
 
 APP_TITLE = "Kanvas"
@@ -394,9 +394,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             position INTEGER NOT NULL
         )
     """)
-    # project_documents is created now (so a later phase lands without a
-    # migration) but gets no CRUD or UI yet - nothing writes to it in this
-    # phase. project_activity_log is fully wired up (Phase 3).
+    # project_documents (Phase 4) and project_activity_log (Phase 3) are
+    # both fully wired up.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS project_documents (
             id TEXT PRIMARY KEY,
@@ -1371,10 +1370,8 @@ def delete_project(conn: sqlite3.Connection, project_id: str) -> None:
     """Deletes a project along with its entire board tree (every board,
     column, task and subtask reachable from the Main Board) and its
     Document Library. Deliberately does NOT touch project_activity_log -
-    even though nothing writes to it yet in this phase, log entries are
-    meant to be a permanent audit trail (see the Activity Log's future
-    permanence requirement) and should survive a project delete once
-    that feature is built."""
+    log entries are a permanent audit trail (§9.2) and survive a project
+    delete, same as they survive a board or task delete."""
     project = get_project(conn, project_id)
     if project is not None and project.get("main_board_id"):
         delete_project_board(conn, project["main_board_id"])
@@ -1383,6 +1380,107 @@ def delete_project(conn: sqlite3.Connection, project_id: str) -> None:
     conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
     conn.commit()
     _compact_project_positions(conn)
+
+
+# -- Document Library (flat, project-wide list of file/URL references;    --
+# -- not attached to any task or board - see issue #2 §8) -----------------
+
+PROJECT_DOCUMENT_KINDS = [
+    ("file", "Local File"),
+    ("url", "URL"),
+]
+
+
+def get_project_documents(conn: sqlite3.Connection, project_id: str, search_text: str = "") -> list:
+    """Document Library screen's list - position order. search_text (§8.4)
+    matches label, notes, or the raw path/URL."""
+    query = "SELECT * FROM project_documents WHERE project_id = ?"
+    params = [project_id]
+    if search_text.strip():
+        query += " AND (label LIKE ? OR notes LIKE ? OR path_or_url LIKE ?)"
+        like = f"%{search_text.strip()}%"
+        params.extend([like, like, like])
+    query += " ORDER BY position"
+    rows = conn.execute(query, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_project_document(conn: sqlite3.Connection, document_id: str):
+    row = conn.execute("SELECT * FROM project_documents WHERE id = ?", (document_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def add_project_document(
+    conn: sqlite3.Connection, project_id: str, kind: str, path_or_url: str, label: str, notes: str = "",
+) -> dict:
+    """No existence-checking for files or format-checking for URLs (§8.1/
+    §8.2) - only the label and path/URL are required to be non-empty."""
+    path_or_url = path_or_url.strip()
+    label = label.strip()
+    if not path_or_url:
+        raise ValueError("A file path or URL is required.")
+    if not label:
+        raise ValueError("A label is required.")
+    if kind not in dict(PROJECT_DOCUMENT_KINDS):
+        raise ValueError(f"Unknown document kind: {kind}")
+
+    max_position_row = conn.execute(
+        "SELECT MAX(position) AS m FROM project_documents WHERE project_id = ?", (project_id,)
+    ).fetchone()
+    next_position = (max_position_row["m"] + 1) if max_position_row["m"] is not None else 0
+
+    document_id = uuid.uuid4().hex
+    conn.execute(
+        "INSERT INTO project_documents "
+        "(id, project_id, kind, path_or_url, label, notes, position, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (document_id, project_id, kind, path_or_url, label, notes.strip(), next_position, _now()),
+    )
+    conn.commit()
+    return get_project_document(conn, document_id)
+
+
+def update_project_document(conn: sqlite3.Connection, document_id: str, label: str, notes: str) -> None:
+    label = label.strip()
+    if not label:
+        raise ValueError("A label is required.")
+    conn.execute(
+        "UPDATE project_documents SET label = ?, notes = ? WHERE id = ?", (label, notes.strip(), document_id)
+    )
+    conn.commit()
+
+
+def _compact_project_document_positions(conn: sqlite3.Connection, project_id: str) -> None:
+    for position, doc in enumerate(get_project_documents(conn, project_id)):
+        if doc["position"] != position:
+            conn.execute("UPDATE project_documents SET position = ? WHERE id = ?", (position, doc["id"]))
+    conn.commit()
+
+
+def delete_project_document(conn: sqlite3.Connection, document_id: str) -> None:
+    doc = get_project_document(conn, document_id)
+    if doc is None:
+        return
+    conn.execute("DELETE FROM project_documents WHERE id = ?", (document_id,))
+    conn.commit()
+    _compact_project_document_positions(conn, doc["project_id"])
+
+
+def move_project_document(conn: sqlite3.Connection, project_id: str, document_id: str, direction: int) -> None:
+    docs = get_project_documents(conn, project_id)
+    ids = [d["id"] for d in docs]
+    if document_id not in ids:
+        return
+
+    idx = ids.index(document_id)
+    new_idx = idx + direction
+    if new_idx < 0 or new_idx >= len(docs):
+        return
+
+    docs[idx], docs[new_idx] = docs[new_idx], docs[idx]
+    for position, doc in enumerate(docs):
+        conn.execute("UPDATE project_documents SET position = ? WHERE id = ?", (position, doc["id"]))
+    conn.commit()
 
 
 # -- Project boards (Main Board or Sub-board - same shape, same tables) --
@@ -4949,6 +5047,107 @@ class BulkAddProjectTasksDialog(QDialog):
         }
 
 
+class AddDocumentDialog(QDialog):
+    """Add-entry dialog for the Document Library (issue §8.2): a Local
+    File / URL toggle, then either a native file-picker or a plain text
+    field for the path/URL, a required Label, and optional Notes. No
+    validation beyond non-empty label/path-or-url - a broken path or
+    malformed URL is accepted, since opening it fails gracefully later
+    rather than being pre-flighted here (§8.1)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Document")
+        self.resize(420, 320)
+
+        layout = QVBoxLayout(self)
+
+        kind_row = QHBoxLayout()
+        self.file_radio = QRadioButton("Local File")
+        self.url_radio = QRadioButton("URL")
+        self.file_radio.setChecked(True)
+        kind_group = QButtonGroup(self)
+        kind_group.addButton(self.file_radio)
+        kind_group.addButton(self.url_radio)
+        self.file_radio.toggled.connect(self._on_kind_toggled)
+        kind_row.addWidget(self.file_radio)
+        kind_row.addWidget(self.url_radio)
+        kind_row.addStretch()
+        layout.addLayout(kind_row)
+
+        path_row = QHBoxLayout()
+        self.path_edit = QLineEdit()
+        self.path_edit.setPlaceholderText("Choose a file...")
+        self.path_edit.textChanged.connect(self._on_path_changed)
+        path_row.addWidget(self.path_edit, stretch=1)
+        self.browse_btn = QPushButton("Browse...")
+        self.browse_btn.clicked.connect(self._on_browse)
+        path_row.addWidget(self.browse_btn)
+        layout.addLayout(path_row)
+
+        layout.addWidget(QLabel("Label"))
+        self.label_edit = QLineEdit()
+        self.label_edit.setPlaceholderText("What shows in the list")
+        layout.addWidget(self.label_edit)
+
+        layout.addWidget(QLabel("Notes (optional)"))
+        self.notes_edit = QTextEdit()
+        layout.addWidget(self.notes_edit, stretch=1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        add_btn = QPushButton("Add")
+        add_btn.setProperty("accent", True)
+        add_btn.setDefault(True)
+        add_btn.clicked.connect(self._on_add)
+        btn_row.addWidget(add_btn)
+        layout.addLayout(btn_row)
+
+        self._label_user_edited = False
+        self.label_edit.textEdited.connect(lambda: setattr(self, "_label_user_edited", True))
+        self._on_kind_toggled(True)
+
+    def _on_kind_toggled(self, _checked: bool) -> None:
+        is_file = self.file_radio.isChecked()
+        self.browse_btn.setVisible(is_file)
+        self.path_edit.setPlaceholderText("Choose a file..." if is_file else "https://...")
+        self.path_edit.setReadOnly(False)
+
+    def _on_browse(self) -> None:
+        path, _filter = QFileDialog.getOpenFileName(self, "Choose a file")
+        if path:
+            self.path_edit.setText(path)
+
+    def _on_path_changed(self, text: str) -> None:
+        # Default the label to the path/URL's basename until the user
+        # types their own - mirrors how templates pre-fill titles elsewhere.
+        if self._label_user_edited:
+            return
+        base = os.path.basename(text.rstrip("/")) if self.file_radio.isChecked() else text
+        self.label_edit.setText(base)
+
+    def _on_add(self) -> None:
+        if not self.path_edit.text().strip():
+            kind_word = "file" if self.file_radio.isChecked() else "URL"
+            QMessageBox.warning(self, "Required", f"Choose a {kind_word}.")
+            return
+        if not self.label_edit.text().strip():
+            QMessageBox.warning(self, "Label required", "Enter a label.")
+            return
+        self.accept()
+
+    def result_values(self) -> dict:
+        return {
+            "kind": "file" if self.file_radio.isChecked() else "url",
+            "path_or_url": self.path_edit.text().strip(),
+            "label": self.label_edit.text().strip(),
+            "notes": self.notes_edit.toPlainText().strip(),
+        }
+
+
 class ProjectTaskCardDialog(QDialog):
     """Full card view for a Projects task - same shape/rationale as
     TaskCardDialog (subtasks write straight through, everything else only
@@ -6204,6 +6403,145 @@ class ProjectActivityLogView(QWidget):
             self.table.setItem(row, 4, QTableWidgetItem(entry["description"]))
 
 
+class ProjectDocumentLibraryView(QWidget):
+    """Project-wide Document Library screen (issue §8.3) - a flat,
+    reorderable list of file/URL references, not attached to any task or
+    board. Opening an entry hands off to the OS (default file handler or
+    browser) and reports failure gracefully rather than pre-checking that
+    the path/URL is still valid (§8.1)."""
+
+    COLUMN_KIND = 0
+    COLUMN_LABEL = 1
+    COLUMN_NOTES = 2
+
+    def __init__(self, conn: sqlite3.Connection, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.project_id = None
+
+        outer = QVBoxLayout(self)
+
+        toolbar = QHBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search label, notes, or path/URL...")
+        self.search_edit.textChanged.connect(self.refresh)
+        toolbar.addWidget(self.search_edit, stretch=1)
+        add_btn = QPushButton("+ Add Document")
+        add_btn.setProperty("accent", True)
+        add_btn.clicked.connect(self._on_add)
+        toolbar.addWidget(add_btn)
+        outer.addLayout(toolbar)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["Type", "Label", "Notes"])
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(self.COLUMN_NOTES, QHeaderView.Stretch)
+        self.table.itemDoubleClicked.connect(lambda _item: self._on_open())
+        outer.addWidget(self.table, stretch=1)
+
+        action_row = QHBoxLayout()
+        open_btn = QPushButton("Open")
+        open_btn.clicked.connect(self._on_open)
+        action_row.addWidget(open_btn)
+        up_btn = QPushButton("Move Up")
+        up_btn.clicked.connect(lambda: self._on_move(-1))
+        action_row.addWidget(up_btn)
+        down_btn = QPushButton("Move Down")
+        down_btn.clicked.connect(lambda: self._on_move(1))
+        action_row.addWidget(down_btn)
+        action_row.addStretch()
+        delete_btn = QPushButton("Delete")
+        delete_btn.setStyleSheet("color: #b00000;")
+        delete_btn.clicked.connect(self._on_delete)
+        action_row.addWidget(delete_btn)
+        outer.addLayout(action_row)
+
+    def load_project(self, project_id: str) -> None:
+        self.project_id = project_id
+        self.refresh()
+
+    def refresh(self) -> None:
+        if not self.project_id:
+            self.table.setRowCount(0)
+            return
+
+        documents = get_project_documents(self.conn, self.project_id, search_text=self.search_edit.text())
+        kind_labels = dict(PROJECT_DOCUMENT_KINDS)
+
+        self.table.setRowCount(len(documents))
+        for row, doc in enumerate(documents):
+            kind_item = QTableWidgetItem(kind_labels.get(doc["kind"], doc["kind"]))
+            kind_item.setData(Qt.UserRole, doc["id"])
+            self.table.setItem(row, self.COLUMN_KIND, kind_item)
+            self.table.setItem(row, self.COLUMN_LABEL, QTableWidgetItem(doc["label"]))
+            self.table.setItem(row, self.COLUMN_NOTES, QTableWidgetItem(doc.get("notes") or ""))
+
+    def _selected_document_id(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return None
+        return self.table.item(row, self.COLUMN_KIND).data(Qt.UserRole)
+
+    def _on_add(self) -> None:
+        if not self.project_id:
+            return
+        dlg = AddDocumentDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        values = dlg.result_values()
+        add_project_document(
+            self.conn, self.project_id, values["kind"], values["path_or_url"], values["label"], values["notes"],
+        )
+        self.refresh()
+
+    def _on_open(self) -> None:
+        document_id = self._selected_document_id()
+        if document_id is None:
+            return
+        doc = get_project_document(self.conn, document_id)
+        if doc is None:
+            return
+
+        url = QUrl.fromLocalFile(doc["path_or_url"]) if doc["kind"] == "file" else QUrl(doc["path_or_url"])
+        if not QDesktopServices.openUrl(url):
+            QMessageBox.warning(
+                self, "Couldn't open",
+                "Couldn't open - the file may have moved or been deleted." if doc["kind"] == "file"
+                else "Couldn't open that URL.",
+            )
+
+    def _on_move(self, direction: int) -> None:
+        document_id = self._selected_document_id()
+        if document_id is None:
+            return
+        move_project_document(self.conn, self.project_id, document_id, direction)
+        self.refresh()
+        # Re-locate the moved row by its id so selection follows it.
+        for row in range(self.table.rowCount()):
+            if self.table.item(row, self.COLUMN_KIND).data(Qt.UserRole) == document_id:
+                self.table.selectRow(row)
+                break
+
+    def _on_delete(self) -> None:
+        document_id = self._selected_document_id()
+        if document_id is None:
+            return
+        doc = get_project_document(self.conn, document_id)
+        if doc is None:
+            return
+        reply = QMessageBox.question(
+            self, "Delete document", f'Remove "{doc["label"]}" from the library?', QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        delete_project_document(self.conn, document_id)
+        self.refresh()
+
+
 class ProjectsHub(QWidget):
     """The Projects page of the app's central QStackedWidget (see main()).
     Owns all Projects UI state - current project/board, the breadcrumb,
@@ -6286,6 +6624,11 @@ class ProjectsHub(QWidget):
         self.activity_log_btn.clicked.connect(self.show_activity_log)
         toolbar.addWidget(self.activity_log_btn)
 
+        self.document_library_btn = QPushButton("Documents")
+        self.document_library_btn.setToolTip("View the project-wide document library")
+        self.document_library_btn.clicked.connect(self.show_document_library)
+        toolbar.addWidget(self.document_library_btn)
+
         board_page_layout.addLayout(toolbar)
 
         view_row = QHBoxLayout()
@@ -6328,9 +6671,22 @@ class ProjectsHub(QWidget):
         self.activity_log_view = ProjectActivityLogView(conn, self)
         activity_log_page_layout.addWidget(self.activity_log_view, stretch=1)
 
+        self.document_library_page = QWidget()
+        document_library_page_layout = QVBoxLayout(self.document_library_page)
+        document_library_page_layout.setContentsMargins(0, 0, 0, 0)
+        docs_back_row = QHBoxLayout()
+        docs_back_btn = QPushButton("← Back to Board")
+        docs_back_btn.clicked.connect(self.show_board_page)
+        docs_back_row.addWidget(docs_back_btn)
+        docs_back_row.addStretch()
+        document_library_page_layout.addLayout(docs_back_row)
+        self.document_library_view = ProjectDocumentLibraryView(conn, self)
+        document_library_page_layout.addWidget(self.document_library_view, stretch=1)
+
         self.page_stack = QStackedWidget()
-        self.page_stack.addWidget(self.board_page)          # index 0
-        self.page_stack.addWidget(self.activity_log_page)    # index 1
+        self.page_stack.addWidget(self.board_page)              # index 0
+        self.page_stack.addWidget(self.activity_log_page)       # index 1
+        self.page_stack.addWidget(self.document_library_page)   # index 2
         outer.addWidget(self.page_stack, stretch=1)
 
     # -- navigation --------------------------------------------------------
@@ -6385,6 +6741,12 @@ class ProjectsHub(QWidget):
             return
         self.activity_log_view.load_project(self.current_project_id)
         self.page_stack.setCurrentWidget(self.activity_log_page)
+
+    def show_document_library(self) -> None:
+        if not self.current_project_id:
+            return
+        self.document_library_view.load_project(self.current_project_id)
+        self.page_stack.setCurrentWidget(self.document_library_page)
 
     def show_board_page(self) -> None:
         self.page_stack.setCurrentWidget(self.board_page)
