@@ -424,6 +424,22 @@ def init_db(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL
         )
     """)
+    # Standard (non-project) boards' equivalent of project_activity_log -
+    # scoped to a single board rather than a whole project tree.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS board_activity_log (
+            id TEXT PRIMARY KEY,
+            board_id TEXT NOT NULL,
+            task_id TEXT,
+            task_title_snapshot TEXT NOT NULL DEFAULT '',
+            action_type TEXT NOT NULL,
+            field_name TEXT,
+            old_value TEXT,
+            new_value TEXT,
+            description TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+    """)
     conn.commit()
 
     _migrate_legacy_single_board_schema(conn)
@@ -516,6 +532,7 @@ def delete_board(conn: sqlite3.Connection, board_id: str) -> None:
         (board_id,),
     )
     conn.execute("DELETE FROM automation_rules WHERE board_id = ?", (board_id,))
+    conn.execute("DELETE FROM board_activity_log WHERE board_id = ?", (board_id,))
     conn.execute("DELETE FROM boards WHERE id = ?", (board_id,))
     conn.commit()
     _compact_board_positions(conn)
@@ -649,7 +666,10 @@ def move_column(conn: sqlite3.Connection, board_id: str, status: str, direction:
 
 # -- Tasks (looked up by their own id once created; add/list need board_id) --
 
-def add_task(conn: sqlite3.Connection, board_id: str, title: str, notes: str = "", status: str = None) -> dict:
+def add_task(
+    conn: sqlite3.Connection, board_id: str, title: str, notes: str = "",
+    status: str = None, due_date: str = "", joplin_link: str = "",
+) -> dict:
     if status is None:
         status = get_default_new_task_status(conn, board_id)
     if status is None:
@@ -658,11 +678,14 @@ def add_task(conn: sqlite3.Connection, board_id: str, title: str, notes: str = "
     task_id = uuid.uuid4().hex
     now = _now()
     conn.execute(
-        "INSERT INTO tasks (id, board_id, title, notes, status, created, updated) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (task_id, board_id, title, notes, status, now, now),
+        "INSERT INTO tasks (id, board_id, title, notes, status, created, updated, due_date, joplin_link) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (task_id, board_id, title, notes, status, now, now, due_date, joplin_link),
     )
     conn.commit()
-    return get_task(conn, task_id)
+    task = get_task(conn, task_id)
+    _log_board_task_event(conn, task, "created", f'Created "{title}"')
+    return task
 
 
 def get_task(conn: sqlite3.Connection, task_id: str):
@@ -686,25 +709,55 @@ def update_task(
     due_date: str = "",
     joplin_link: str = "",
 ) -> None:
+    old_task = get_task(conn, task_id)
     conn.execute(
         "UPDATE tasks SET title = ?, notes = ?, due_date = ?, joplin_link = ?, updated = ? WHERE id = ?",
         (title, notes, due_date, joplin_link, _now(), task_id),
     )
     conn.commit()
 
+    if old_task is None:
+        return
+    new_task = get_task(conn, task_id)
+    # One entry per changed field, same as the Projects log.
+    for field_name in ("title", "notes", "due_date", "joplin_link"):
+        old_value = old_task.get(field_name) or ""
+        new_value = new_task.get(field_name) or ""
+        if old_value == new_value:
+            continue
+        label = _BOARD_ACTIVITY_FIELD_LABELS[field_name]
+        description = f'Changed {label} from "{old_value or "(empty)"}" to "{new_value or "(empty)"}"'
+        _log_board_task_event(
+            conn, new_task, "field_changed", description,
+            field_name=field_name, old_value=old_value, new_value=new_value,
+        )
+
 
 def move_task(conn: sqlite3.Connection, task_id: str, new_status: str) -> None:
+    task = get_task(conn, task_id)
     conn.execute(
         "UPDATE tasks SET status = ?, updated = ? WHERE id = ?",
         (new_status, _now(), task_id),
     )
     conn.commit()
 
+    if task is None or task["status"] == new_status:
+        return
+    old_column = get_column(conn, task["board_id"], task["status"])
+    new_column = get_column(conn, task["board_id"], new_status)
+    old_name = old_column["name"] if old_column else task["status"]
+    new_name = new_column["name"] if new_column else new_status
+    _log_board_task_event(
+        conn, task, "moved", f'Moved from "{old_name}" to "{new_name}"',
+        old_value=old_name, new_value=new_name,
+    )
+
 
 def set_task_completed(conn: sqlite3.Connection, task_id: str, completed: bool) -> None:
     """Completion is tracked independently of column - a completed task
     stays wherever it is, it's just hidden from the board by default (see
     KanbanBoard's "Show Completed" toggle)."""
+    task = get_task(conn, task_id)
     now = _now()
     conn.execute(
         "UPDATE tasks SET completed = ?, completed_at = ?, updated = ? WHERE id = ?",
@@ -712,8 +765,18 @@ def set_task_completed(conn: sqlite3.Connection, task_id: str, completed: bool) 
     )
     conn.commit()
 
+    if task is None or bool(task["completed"]) == completed:
+        return
+    _log_board_task_event(
+        conn, task, "completed" if completed else "uncompleted",
+        "Marked complete" if completed else "Marked incomplete",
+    )
+
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> None:
+    task = get_task(conn, task_id)
+    if task is not None:
+        _log_board_task_event(conn, task, "deleted", f'Deleted "{task["title"]}"')
     conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
     conn.execute("DELETE FROM subtasks WHERE task_id = ?", (task_id,))
     conn.commit()
@@ -745,17 +808,38 @@ def add_subtask(conn: sqlite3.Connection, task_id: str, title: str) -> dict:
     )
     conn.commit()
     row = conn.execute("SELECT * FROM subtasks WHERE id = ?", (subtask_id,)).fetchone()
+
+    task = get_task(conn, task_id)
+    if task is not None:
+        _log_board_task_event(conn, task, "subtask_added", f'Added subtask "{title}"')
     return dict(row)
 
 
 def set_subtask_done(conn: sqlite3.Connection, subtask_id: str, done: bool) -> None:
+    subtask = conn.execute("SELECT * FROM subtasks WHERE id = ?", (subtask_id,)).fetchone()
     conn.execute("UPDATE subtasks SET done = ? WHERE id = ?", (1 if done else 0, subtask_id))
     conn.commit()
 
+    if subtask is None or bool(subtask["done"]) == done:
+        return
+    task = get_task(conn, subtask["task_id"])
+    if task is not None:
+        verb = "Checked" if done else "Unchecked"
+        _log_board_task_event(
+            conn, task, "subtask_done", f'{verb} subtask "{subtask["title"]}"',
+            old_value="0" if done else "1", new_value="1" if done else "0",
+        )
+
 
 def delete_subtask(conn: sqlite3.Connection, subtask_id: str) -> None:
+    subtask = conn.execute("SELECT * FROM subtasks WHERE id = ?", (subtask_id,)).fetchone()
     conn.execute("DELETE FROM subtasks WHERE id = ?", (subtask_id,))
     conn.commit()
+
+    if subtask is not None:
+        task = get_task(conn, subtask["task_id"])
+        if task is not None:
+            _log_board_task_event(conn, task, "subtask_removed", f'Removed subtask "{subtask["title"]}"')
 
 
 # -- Task templates (per-board presets that prefill the New Task dialog) ----
@@ -1187,9 +1271,7 @@ def _run_create_task_rule(conn: sqlite3.Connection, rule: dict) -> None:
     if due_offset_days is not None:
         due_date = (date.today() + timedelta(days=due_offset_days)).strftime("%Y-%m-%d")
 
-    task = add_task(conn, rule["board_id"], title, notes, status)
-    if due_date or joplin_link:
-        update_task(conn, task["id"], title, notes, due_date, joplin_link)
+    task = add_task(conn, rule["board_id"], title, notes, status, due_date, joplin_link)
     for subtask_title in subtask_titles:
         add_subtask(conn, task["id"], subtask_title)
 
@@ -2314,6 +2396,69 @@ def get_activity_log_board_paths(conn: sqlite3.Connection, project_id: str) -> l
         (project_id,),
     ).fetchall()
     return [r["board_path_snapshot"] for r in rows]
+
+
+# -- Standard-board Activity Log ------------------------------------------
+#
+# Same idea as the project log above, but scoped to one standard board and
+# without board-path/sub-board concepts. Entries live in board_activity_log
+# and are removed along with their board (see delete_board), but survive
+# the deletion of the individual task they name via task_title_snapshot.
+
+_BOARD_ACTIVITY_FIELD_LABELS = {
+    "title": "Title",
+    "notes": "Notes",
+    "due_date": "Due date",
+    "joplin_link": "Joplin link",
+}
+
+BOARD_ACTIVITY_ACTION_TYPES = [a for a in ACTIVITY_ACTION_TYPES if a[0] != "subboard_created"]
+
+
+def _log_board_task_event(
+    conn: sqlite3.Connection, task: dict, action_type: str, description: str,
+    field_name: str = None, old_value: str = None, new_value: str = None,
+) -> None:
+    conn.execute(
+        "INSERT INTO board_activity_log "
+        "(id, board_id, task_id, task_title_snapshot, action_type, field_name, "
+        "old_value, new_value, description, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            uuid.uuid4().hex, task["board_id"], task["id"], task["title"], action_type,
+            field_name, old_value, new_value, description, _now(),
+        ),
+    )
+    conn.commit()
+
+
+def get_board_activity_log_entries(
+    conn: sqlite3.Connection, board_id: str, search_text: str = "",
+    action_types: list = None, date_from: str = "", date_to: str = "",
+) -> list:
+    """Newest first, with search/action-type/date filters."""
+    query = "SELECT * FROM board_activity_log WHERE board_id = ?"
+    params = [board_id]
+
+    if search_text.strip():
+        query += " AND (description LIKE ? OR task_title_snapshot LIKE ?)"
+        like = f"%{search_text.strip()}%"
+        params.extend([like, like])
+
+    if action_types:
+        placeholders = ",".join("?" for _ in action_types)
+        query += f" AND action_type IN ({placeholders})"
+        params.extend(action_types)
+
+    if date_from:
+        query += " AND created_at >= ?"
+        params.append(date_from)
+    if date_to:
+        query += " AND created_at <= ?"
+        params.append(f"{date_to}T23:59:59")
+
+    query += " ORDER BY created_at DESC"
+    return [dict(r) for r in conn.execute(query, params).fetchall()]
 
 
 # ---------------------------------------------------------------------------
@@ -3730,6 +3875,100 @@ class BoardReportDialog(QDialog):
         layout.addWidget(close_btn)
 
 
+class BoardActivityLogDialog(QDialog):
+    """Read-only Activity Log for one standard board - the counterpart of
+    ProjectActivityLogView, minus the board filter (a standard board has no
+    sub-boards, so there's only ever one board's history to show)."""
+
+    ACTION_FILTER_ALL = "__all__"
+
+    def __init__(self, conn: sqlite3.Connection, board_id: str, board_name: str, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.board_id = board_id
+        self.setWindowTitle(f"Activity Log — {board_name}")
+        self.resize(760, 480)
+
+        outer = QVBoxLayout(self)
+
+        filter_row = QHBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search description or task title...")
+        self.search_edit.textChanged.connect(self.refresh)
+        filter_row.addWidget(self.search_edit, stretch=1)
+
+        self.action_combo = QComboBox()
+        self.action_combo.addItem("All Actions", self.ACTION_FILTER_ALL)
+        for action_type, label in BOARD_ACTIVITY_ACTION_TYPES:
+            self.action_combo.addItem(label, action_type)
+        self.action_combo.currentIndexChanged.connect(self.refresh)
+        filter_row.addWidget(self.action_combo)
+        outer.addLayout(filter_row)
+
+        date_row = QHBoxLayout()
+        date_row.addWidget(QLabel("From"))
+        self.date_from_check = QCheckBox()
+        date_row.addWidget(self.date_from_check)
+        self.date_from_edit = QDateEdit(QDate.currentDate())
+        self.date_from_edit.setCalendarPopup(True)
+        self.date_from_edit.setDisplayFormat("yyyy-MM-dd")
+        self.date_from_edit.setEnabled(False)
+        self.date_from_check.toggled.connect(self.date_from_edit.setEnabled)
+        self.date_from_check.toggled.connect(self.refresh)
+        self.date_from_edit.dateChanged.connect(self.refresh)
+        date_row.addWidget(self.date_from_edit)
+
+        date_row.addWidget(QLabel("To"))
+        self.date_to_check = QCheckBox()
+        date_row.addWidget(self.date_to_check)
+        self.date_to_edit = QDateEdit(QDate.currentDate())
+        self.date_to_edit.setCalendarPopup(True)
+        self.date_to_edit.setDisplayFormat("yyyy-MM-dd")
+        self.date_to_edit.setEnabled(False)
+        self.date_to_check.toggled.connect(self.date_to_edit.setEnabled)
+        self.date_to_check.toggled.connect(self.refresh)
+        self.date_to_edit.dateChanged.connect(self.refresh)
+        date_row.addWidget(self.date_to_edit)
+        date_row.addStretch()
+        outer.addLayout(date_row)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Date", "Task", "Action", "Description"])
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        outer.addWidget(self.table, stretch=1)
+
+        close_btn = QPushButton("Close")
+        close_btn.setDefault(True)
+        close_btn.clicked.connect(self.accept)
+        outer.addWidget(close_btn)
+
+        self.refresh()
+
+    def refresh(self) -> None:
+        action_filter = self.action_combo.currentData()
+        action_types = [action_filter] if action_filter and action_filter != self.ACTION_FILTER_ALL else None
+        date_from = self.date_from_edit.date().toString("yyyy-MM-dd") if self.date_from_check.isChecked() else ""
+        date_to = self.date_to_edit.date().toString("yyyy-MM-dd") if self.date_to_check.isChecked() else ""
+
+        entries = get_board_activity_log_entries(
+            self.conn, self.board_id, search_text=self.search_edit.text(),
+            action_types=action_types, date_from=date_from, date_to=date_to,
+        )
+
+        action_labels = dict(ACTIVITY_ACTION_TYPES)
+        self.table.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
+            self.table.setItem(row, 0, QTableWidgetItem(entry["created_at"]))
+            self.table.setItem(row, 1, QTableWidgetItem(entry["task_title_snapshot"]))
+            self.table.setItem(row, 2, QTableWidgetItem(action_labels.get(entry["action_type"], entry["action_type"])))
+            self.table.setItem(row, 3, QTableWidgetItem(entry["description"]))
+
+
 class QuickAddDialog(QDialog):
     """Popped up by the global Ctrl+Space shortcut, from anywhere, so it
     needs its own board picker (unlike NewTaskDialog, which always targets
@@ -3831,9 +4070,7 @@ class QuickAddDialog(QDialog):
         due_date = self.due_date_edit.date().toString("yyyy-MM-dd") if self.due_date_check.isChecked() else ""
         joplin_link = self.joplin_link_edit.text().strip()
 
-        task = add_task(self.conn, board_id, title, notes, status)
-        if due_date or joplin_link:
-            update_task(self.conn, task["id"], title, notes, due_date, joplin_link)
+        add_task(self.conn, board_id, title, notes, status, due_date, joplin_link)
         self.added_board_ids.add(board_id)
 
         if self.multiple_check.isChecked():
@@ -4292,6 +4529,11 @@ class KanbanBoard(QWidget):
         self.report_btn.clicked.connect(self.show_report_ui)
         toolbar.addWidget(self.report_btn)
 
+        self.activity_log_btn = QPushButton("Activity Log")
+        self.activity_log_btn.setToolTip("View the task history log for this board")
+        self.activity_log_btn.clicked.connect(self.show_activity_log_ui)
+        toolbar.addWidget(self.activity_log_btn)
+
         toolbar.addStretch()
 
         self.add_col_btn = QPushButton("+ Column")
@@ -4573,12 +4815,10 @@ class KanbanBoard(QWidget):
             return
 
         values = dialog.result_values()
-        task = add_task(self.conn, self.current_board_id, values["title"], values["notes"], values["status"])
-        if values["due_date"] or values["joplin_link"]:
-            update_task(
-                self.conn, task["id"], values["title"], values["notes"],
-                values["due_date"], values["joplin_link"],
-            )
+        task = add_task(
+            self.conn, self.current_board_id, values["title"], values["notes"], values["status"],
+            values["due_date"], values["joplin_link"],
+        )
         for subtask_title in template_subtask_titles:
             add_subtask(self.conn, task["id"], subtask_title)
         self.refresh()
@@ -4618,6 +4858,12 @@ class KanbanBoard(QWidget):
         if not self.current_board_id:
             return
         dialog = BoardReportDialog(self.conn, self.current_board_id, self._current_board_name(), self)
+        dialog.exec()
+
+    def show_activity_log_ui(self) -> None:
+        if not self.current_board_id:
+            return
+        dialog = BoardActivityLogDialog(self.conn, self.current_board_id, self._current_board_name(), self)
         dialog.exec()
 
     def _run_due_automations(self) -> None:
