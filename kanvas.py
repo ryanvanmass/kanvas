@@ -187,6 +187,22 @@ def _migrate_task_completion_fields(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_project_settings_fields(conn: sqlite3.Connection) -> None:
+    """Adds the per-project view/date settings columns to "projects" for
+    databases created before the project settings page existed. The
+    defaults reproduce the old behavior: every view on, both dates on."""
+    if not _table_has_column(conn, "projects", "enabled_views"):
+        conn.execute(
+            "ALTER TABLE projects ADD COLUMN enabled_views TEXT NOT NULL "
+            "DEFAULT 'kanban,list,missing_dates,gantt,calendar'"
+        )
+    if not _table_has_column(conn, "projects", "use_start_dates"):
+        conn.execute("ALTER TABLE projects ADD COLUMN use_start_dates INTEGER NOT NULL DEFAULT 1")
+    if not _table_has_column(conn, "projects", "use_end_dates"):
+        conn.execute("ALTER TABLE projects ADD COLUMN use_end_dates INTEGER NOT NULL DEFAULT 1")
+    conn.commit()
+
+
 def _migrate_legacy_single_board_schema(conn: sqlite3.Connection) -> None:
     """If this database was created by a pre-multi-board version of this
     app, its "columns" table has no board_id column and a single-column
@@ -445,6 +461,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     _migrate_legacy_single_board_schema(conn)
     _migrate_task_card_fields(conn)
     _migrate_task_completion_fields(conn)
+    _migrate_project_settings_fields(conn)
 
     # Fresh install: no boards exist yet at all (migration only runs for
     # upgrades, so this is the true "never used before" case).
@@ -1391,6 +1408,60 @@ def get_project(conn: sqlite3.Connection, project_id: str):
     return dict(row) if row is not None else None
 
 
+# Every view a project can show, in toolbar order. ProjectsHub.VIEWS pairs
+# these with display labels; they live here so the data layer can validate
+# a settings change without importing any UI.
+PROJECT_VIEW_KEYS = ("kanban", "list", "missing_dates", "gantt", "calendar")
+
+
+def project_view_available(view_key: str, use_start_dates: bool, use_end_dates: bool) -> bool:
+    """Whether a view can work at all given which dates a project tracks:
+    Gantt draws bars from start to due, so it needs both; Calendar needs
+    a due date to place a task on a day; Missing Dates only makes sense
+    while there's at least one date to be missing."""
+    if view_key == "gantt":
+        return use_start_dates and use_end_dates
+    if view_key == "calendar":
+        return use_end_dates
+    if view_key == "missing_dates":
+        return use_start_dates or use_end_dates
+    return True
+
+
+def get_project_settings(conn: sqlite3.Connection, project_id: str) -> dict:
+    """{"enabled_views": [...], "use_start_dates": bool, "use_end_dates":
+    bool, "views": [...]} for a project. "enabled_views" is what the user
+    ticked; "views" is the subset that's also available under the date
+    settings (see project_view_available) - the ones actually shown, in
+    toolbar order, and never empty (Kanban is the fallback)."""
+    project = get_project(conn, project_id)
+    raw_views = (project or {}).get("enabled_views") or ",".join(PROJECT_VIEW_KEYS)
+    enabled = [v for v in PROJECT_VIEW_KEYS if v in raw_views.split(",")]
+    use_start = bool((project or {}).get("use_start_dates", 1))
+    use_end = bool((project or {}).get("use_end_dates", 1))
+    views = [v for v in enabled if project_view_available(v, use_start, use_end)]
+    return {
+        "enabled_views": enabled,
+        "use_start_dates": use_start,
+        "use_end_dates": use_end,
+        "views": views or ["kanban"],
+    }
+
+
+def update_project_settings(
+    conn: sqlite3.Connection, project_id: str, enabled_views: list,
+    use_start_dates: bool, use_end_dates: bool,
+) -> None:
+    enabled = [v for v in PROJECT_VIEW_KEYS if v in enabled_views]
+    if not any(project_view_available(v, use_start_dates, use_end_dates) for v in enabled):
+        raise ValueError("At least one view must stay on.")
+    conn.execute(
+        "UPDATE projects SET enabled_views = ?, use_start_dates = ?, use_end_dates = ? WHERE id = ?",
+        (",".join(enabled), int(use_start_dates), int(use_end_dates), project_id),
+    )
+    conn.commit()
+
+
 def add_project(conn: sqlite3.Connection, name: str) -> dict:
     name = name.strip()
     if not name:
@@ -1807,7 +1878,12 @@ def duplicate_project(conn: sqlite3.Connection, project_id: str, new_name: str =
     conn.commit()
 
     new_main_board = clone_board_subtree(conn, source["main_board_id"], new_project_id, None, name=name)
-    conn.execute("UPDATE projects SET main_board_id = ? WHERE id = ?", (new_main_board["id"], new_project_id))
+    conn.execute(
+        "UPDATE projects SET main_board_id = ?, enabled_views = ?, use_start_dates = ?, use_end_dates = ? "
+        "WHERE id = ?",
+        (new_main_board["id"], source["enabled_views"], source["use_start_dates"],
+         source["use_end_dates"], new_project_id),
+    )
     conn.commit()
 
     return get_project(conn, new_project_id)
@@ -1973,10 +2049,20 @@ def get_project_tasks_for_board(conn: sqlite3.Connection, board_id: str) -> list
     return [dict(r) for r in rows]
 
 
-def get_missing_dates_tasks(conn: sqlite3.Connection, board_id: str) -> list:
+def get_missing_dates_tasks(
+    conn: sqlite3.Connection, board_id: str, use_start_dates: bool = True, use_end_dates: bool = True,
+) -> list:
+    """Tasks missing a date the project actually tracks - a project with
+    start dates turned off doesn't count a blank start as "missing"."""
+    conditions = []
+    if use_start_dates:
+        conditions.append("start_date IS NULL OR start_date = ''")
+    if use_end_dates:
+        conditions.append("due_date IS NULL OR due_date = ''")
+    if not conditions:
+        return []
     rows = conn.execute(
-        "SELECT * FROM project_tasks WHERE board_id = ? "
-        "AND (start_date IS NULL OR start_date = '' OR due_date IS NULL OR due_date = '') "
+        f"SELECT * FROM project_tasks WHERE board_id = ? AND ({' OR '.join(conditions)}) "
         "ORDER BY position ASC",
         (board_id,),
     ).fetchall()
@@ -2033,18 +2119,22 @@ def get_latest_due_date(conn: sqlite3.Connection, board_id: str, exclude_task_id
     return row["d"] if row and row["d"] else None
 
 
-def build_project_task_meta_parts(conn: sqlite3.Connection, task: dict) -> list:
+def build_project_task_meta_parts(
+    conn: sqlite3.Connection, task: dict, use_start_dates: bool = True, use_end_dates: bool = True,
+) -> list:
     """Shared meta-line builder - dates/subtask progress/sub-board
     badge/link - reused by ProjectKanbanWidget's card text and by the
     Gantt/Calendar views' tooltips, so this logic exists exactly once."""
     meta_parts = []
-    if task.get("start_date") and task.get("due_date"):
-        meta_parts.append(f"{task['start_date']} → {task['due_date']}")
-    elif task.get("due_date"):
-        meta_parts.append(f"Due {task['due_date']}")
-    elif task.get("start_date"):
-        meta_parts.append(f"Starts {task['start_date']}")
-    else:
+    start_date = task.get("start_date") if use_start_dates else None
+    due_date = task.get("due_date") if use_end_dates else None
+    if start_date and due_date:
+        meta_parts.append(f"{start_date} → {due_date}")
+    elif due_date:
+        meta_parts.append(f"Due {due_date}")
+    elif start_date:
+        meta_parts.append(f"Starts {start_date}")
+    elif use_start_dates or use_end_dates:
         meta_parts.append("◇ no dates set")
 
     subtasks = get_project_subtasks(conn, task["id"])
@@ -5273,7 +5363,10 @@ class NewProjectTaskDialog(QDialog):
     NewTaskDialog, plus a second date (start_date, for the Gantt/Calendar
     views a later phase adds) and "link" instead of "joplin_link"."""
 
-    def __init__(self, columns: list, default_column_id, parent=None, default_start_date: QDate = None):
+    def __init__(
+        self, columns: list, default_column_id, parent=None, default_start_date: QDate = None,
+        use_start_dates: bool = True, use_end_dates: bool = True,
+    ):
         super().__init__(parent)
         self.setWindowTitle("New Task")
         self.resize(420, 460)
@@ -5292,14 +5385,24 @@ class NewProjectTaskDialog(QDialog):
         self.column_combo.setCurrentIndex(default_idx)
         layout.addWidget(self.column_combo)
 
-        layout.addWidget(QLabel("Start Date"))
+        # A date the project doesn't use is hidden (and so never "Set"):
+        # its widgets still exist so result_values/_sync stay branch-free.
+        start_label = QLabel("Start Date")
+        layout.addWidget(start_label)
         start_default = default_start_date or QDate.currentDate()
         self.start_date_check, self.start_date_edit = self._build_date_row(layout, start_default)
 
-        layout.addWidget(QLabel("Due Date"))
+        due_label = QLabel("Due Date")
+        layout.addWidget(due_label)
         self.due_date_check, self.due_date_edit = self._build_date_row(
             layout, default_project_task_due_date(start_default)
         )
+        for visible, widgets in (
+            (use_start_dates, (start_label, self.start_date_check, self.start_date_edit)),
+            (use_end_dates, (due_label, self.due_date_check, self.due_date_edit)),
+        ):
+            for widget in widgets:
+                widget.setVisible(visible)
 
         layout.addWidget(QLabel("Link"))
         self.link_edit = QLineEdit()
@@ -5564,10 +5667,19 @@ class ProjectTaskCardDialog(QDialog):
     dialog (not a separate reject path) so any field edits made before
     clicking it are still saved by the caller."""
 
-    def __init__(self, conn: sqlite3.Connection, task: dict, columns: list, subboard, parent=None):
+    def __init__(
+        self, conn: sqlite3.Connection, task: dict, columns: list, subboard, parent=None,
+        use_start_dates: bool = True, use_end_dates: bool = True,
+    ):
         super().__init__(parent)
         self.conn = conn
         self.task_id = task["id"]
+        # Dates the project doesn't use are hidden, and keep whatever value
+        # the task already had when saved (see result_values).
+        self._hidden_dates = {
+            "start_date": None if use_start_dates else (task.get("start_date") or ""),
+            "due_date": None if use_end_dates else (task.get("due_date") or ""),
+        }
         self.setWindowTitle(task["title"])
         self.resize(440, 700)
         self.delete_requested = False
@@ -5597,16 +5709,24 @@ class ProjectTaskCardDialog(QDialog):
         self.completed_check.setChecked(bool(task.get("completed")))
         details_layout.addWidget(self.completed_check)
 
-        details_layout.addWidget(QLabel("Start Date"))
+        start_label = QLabel("Start Date")
+        details_layout.addWidget(start_label)
         default_start = default_project_task_start_date(conn, task["board_id"], exclude_task_id=task["id"])
         self.start_date_check, self.start_date_edit = self._build_date_row(
             details_layout, task.get("start_date"), default_start
         )
 
-        details_layout.addWidget(QLabel("Due Date"))
+        due_label = QLabel("Due Date")
+        details_layout.addWidget(due_label)
         self.due_date_check, self.due_date_edit = self._build_date_row(
             details_layout, task.get("due_date"), default_project_task_due_date(self.start_date_edit.date())
         )
+        for visible, widgets in (
+            (use_start_dates, (start_label, self.start_date_check, self.start_date_edit)),
+            (use_end_dates, (due_label, self.due_date_check, self.due_date_edit)),
+        ):
+            for widget in widgets:
+                widget.setVisible(visible)
 
         # Due tracks Start (start+1) until manually edited - but an
         # already-saved due_date counts as "already edited" so it's never
@@ -5782,8 +5902,14 @@ class ProjectTaskCardDialog(QDialog):
             "title": self.title_edit.text().strip(),
             "notes": self.notes_edit.toPlainText().strip(),
             "column_id": self.column_combo.currentData(),
-            "start_date": self.start_date_edit.date().toString("yyyy-MM-dd") if self.start_date_check.isChecked() else "",
-            "due_date": self.due_date_edit.date().toString("yyyy-MM-dd") if self.due_date_check.isChecked() else "",
+            "start_date": (
+                self._hidden_dates["start_date"] if self._hidden_dates["start_date"] is not None
+                else self.start_date_edit.date().toString("yyyy-MM-dd") if self.start_date_check.isChecked() else ""
+            ),
+            "due_date": (
+                self._hidden_dates["due_date"] if self._hidden_dates["due_date"] is not None
+                else self.due_date_edit.date().toString("yyyy-MM-dd") if self.due_date_check.isChecked() else ""
+            ),
             "link": self.link_edit.text().strip(),
             "completed": self.completed_check.isChecked(),
         }
@@ -5879,7 +6005,9 @@ class ProjectKanbanWidget(QWidget):
             col_widget.set_count(len(tasks))
 
     def _task_card_text(self, task: dict) -> str:
-        meta_parts = build_project_task_meta_parts(self.conn, task)
+        meta_parts = build_project_task_meta_parts(
+            self.conn, task, self.hub.settings["use_start_dates"], self.hub.settings["use_end_dates"]
+        )
         text = task["title"]
         if meta_parts:
             text += "\n" + "   ".join(meta_parts)
@@ -5894,7 +6022,9 @@ class ProjectKanbanWidget(QWidget):
         default_column_id = target_status or get_default_new_project_task_column(self.conn, self.board_id)
         default_start = default_project_task_start_date(self.conn, self.board_id)
         dialog = NewProjectTaskDialog(
-            self._columns_cache, default_column_id, self, default_start_date=default_start
+            self._columns_cache, default_column_id, self, default_start_date=default_start,
+            use_start_dates=self.hub.settings["use_start_dates"],
+            use_end_dates=self.hub.settings["use_end_dates"],
         )
         if dialog.exec() != QDialog.Accepted:
             return
@@ -5924,7 +6054,11 @@ class ProjectKanbanWidget(QWidget):
             return
 
         subboard = get_subboard_for_task(self.conn, task_id)
-        dialog = ProjectTaskCardDialog(self.conn, task, self._columns_cache, subboard, self)
+        dialog = ProjectTaskCardDialog(
+            self.conn, task, self._columns_cache, subboard, self,
+            use_start_dates=self.hub.settings["use_start_dates"],
+            use_end_dates=self.hub.settings["use_end_dates"],
+        )
         result = dialog.exec()
 
         if dialog.delete_requested:
@@ -6133,6 +6267,9 @@ class _ProjectTaskTableView(QWidget):
             self.table.setRowCount(0)
             return
 
+        self.table.setColumnHidden(self.COLUMN_START, not self.hub.settings["use_start_dates"])
+        self.table.setColumnHidden(self.COLUMN_DUE, not self.hub.settings["use_end_dates"])
+
         col_name_by_id = {c["id"]: c["name"] for c in get_project_columns(self.conn, self.board_id)}
         tasks = self._fetch_tasks()
 
@@ -6195,7 +6332,9 @@ class ProjectMissingDatesView(_ProjectTaskTableView):
     drop into "Unscheduled" once those views exist."""
 
     def _fetch_tasks(self) -> list:
-        return get_missing_dates_tasks(self.conn, self.board_id)
+        return get_missing_dates_tasks(
+            self.conn, self.board_id, self.hub.settings["use_start_dates"], self.hub.settings["use_end_dates"]
+        )
 
 
 class ProjectGanttChart(QWidget):
@@ -6630,7 +6769,9 @@ class ProjectCalendarView(QWidget):
             chip = QPushButton(label_text)
             chip.setFixedHeight(self.CHIP_HEIGHT)
             chip.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            chip.setToolTip("\n".join(build_project_task_meta_parts(self.conn, t)))
+            chip.setToolTip("\n".join(build_project_task_meta_parts(
+                self.conn, t, self.hub.settings["use_start_dates"], self.hub.settings["use_end_dates"]
+            )))
             fill = project_column_color(self._column_position(t["column_id"]))
             chip.setStyleSheet(
                 f"QPushButton {{ background-color: {fill}; color: white; border: none; "
@@ -6660,7 +6801,7 @@ class ProjectCalendarView(QWidget):
         isn't set, giving a due-only task a single-day span."""
         due = QDate.fromString(task["due_date"], "yyyy-MM-dd")
         start = QDate.fromString(task.get("start_date") or "", "yyyy-MM-dd")
-        if not start.isValid():
+        if not start.isValid() or not self.hub.settings["use_start_dates"]:
             start = due
         return start, due
 
@@ -7019,6 +7160,79 @@ class ProjectRollupView(QWidget):
             self.table.setItem(row, self.COLUMN_PERCENT, QTableWidgetItem(f"{b_percent}%"))
 
 
+class ProjectSettingsDialog(QDialog):
+    """Per-project settings: which views the project shows, and whether
+    its tasks use start and/or end (due) dates. Views that can't work
+    without a date (see project_view_available) are greyed out while that
+    date is off, rather than silently dropped, so it's clear why."""
+
+    def __init__(self, project_name: str, settings: dict, view_labels: list, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"{project_name} - Settings")
+        self.resize(380, 360)
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("<b>Views</b>"))
+        self.view_checks = {}
+        for key, label in view_labels:
+            check = QCheckBox(label)
+            check.setChecked(key in settings["enabled_views"])
+            check.toggled.connect(self._update_state)
+            layout.addWidget(check)
+            self.view_checks[key] = check
+
+        layout.addSpacing(8)
+        layout.addWidget(QLabel("<b>Dates</b>"))
+        self.start_check = QCheckBox("Use start dates")
+        self.start_check.setChecked(settings["use_start_dates"])
+        self.start_check.toggled.connect(self._update_state)
+        layout.addWidget(self.start_check)
+        self.end_check = QCheckBox("Use end (due) dates")
+        self.end_check.setChecked(settings["use_end_dates"])
+        self.end_check.toggled.connect(self._update_state)
+        layout.addWidget(self.end_check)
+        note = QLabel(
+            "Turning a date off hides it everywhere; dates already on tasks are kept. "
+            "Gantt needs both dates, Calendar needs end dates, and Missing Dates needs at least one."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #6e6e6e;")
+        layout.addWidget(note)
+
+        layout.addStretch()
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        self.save_btn = QPushButton("Save")
+        self.save_btn.setProperty("accent", True)
+        self.save_btn.setDefault(True)
+        self.save_btn.clicked.connect(self.accept)
+        btn_row.addWidget(self.save_btn)
+        layout.addLayout(btn_row)
+
+        self._update_state()
+
+    def _update_state(self, *_args) -> None:
+        use_start, use_end = self.start_check.isChecked(), self.end_check.isChecked()
+        for key, check in self.view_checks.items():
+            check.setEnabled(project_view_available(key, use_start, use_end))
+        self.save_btn.setEnabled(any(
+            check.isChecked() and check.isEnabled() for check in self.view_checks.values()
+        ))
+        self.save_btn.setToolTip("" if self.save_btn.isEnabled() else "At least one view must stay on.")
+
+    def result_values(self) -> dict:
+        return {
+            "enabled_views": [key for key, check in self.view_checks.items() if check.isChecked()],
+            "use_start_dates": self.start_check.isChecked(),
+            "use_end_dates": self.end_check.isChecked(),
+        }
+
+
 class ProjectsHub(QWidget):
     """The Projects page of the app's central QStackedWidget (see main()).
     Owns all Projects UI state - current project/board, the breadcrumb,
@@ -7040,6 +7254,13 @@ class ProjectsHub(QWidget):
         self.on_back_to_boards = on_back_to_boards
         self.current_project_id = None
         self.current_board_id = None
+        # The current project's view/date settings (see get_project_settings);
+        # reloaded on every navigate_to_board. The views read the date flags
+        # from here, so it has to exist before they're built.
+        self.settings = {
+            "enabled_views": list(PROJECT_VIEW_KEYS), "use_start_dates": True,
+            "use_end_dates": True, "views": list(PROJECT_VIEW_KEYS),
+        }
 
         outer = QVBoxLayout(self)
 
@@ -7110,6 +7331,11 @@ class ProjectsHub(QWidget):
         self.rollup_btn.setToolTip("View project-wide progress, across every board")
         self.rollup_btn.clicked.connect(self.show_rollup)
         toolbar.addWidget(self.rollup_btn)
+
+        self.settings_btn = QPushButton("Settings")
+        self.settings_btn.setToolTip("Choose this project's views and whether it uses start/end dates")
+        self.settings_btn.clicked.connect(self.show_settings_dialog)
+        toolbar.addWidget(self.settings_btn)
 
         board_page_layout.addLayout(toolbar)
 
@@ -7201,6 +7427,8 @@ class ProjectsHub(QWidget):
 
         self.current_board_id = board_id
         self.current_project_id = board["project_id"]
+        self.settings = get_project_settings(self.conn, self.current_project_id)
+        self._apply_settings_to_toolbar()
 
         self.breadcrumb.set_crumbs(get_board_breadcrumb(self.conn, board_id))
 
@@ -7218,9 +7446,43 @@ class ProjectsHub(QWidget):
         self.gantt_view.load_board(board_id)
         self.calendar_view.load_board(board_id)
 
-        valid_views = {key for key, _ in self.VIEWS}
-        last_view = board.get("last_view") if board.get("last_view") in valid_views else self.VIEW_KANBAN
-        self.set_view(last_view, persist=False)
+        self.set_view(self._usable_view(board.get("last_view")), persist=False)
+
+    def _usable_view(self, view_key) -> str:
+        """view_key if the project shows it, else the first view it does."""
+        return view_key if view_key in self.settings["views"] else self.settings["views"][0]
+
+    def _apply_settings_to_toolbar(self) -> None:
+        """Shows only this project's views in the view row (hiding the row
+        entirely when there's just one to pick from)."""
+        multiple = len(self.settings["views"]) > 1
+        for key, btn in self.view_buttons.items():
+            btn.setVisible(multiple and key in self.settings["views"])
+
+    def show_settings_dialog(self) -> None:
+        if not self.current_project_id:
+            return
+        project = get_project(self.conn, self.current_project_id)
+        dialog = ProjectSettingsDialog(project["name"], self.settings, self.VIEWS, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        values = dialog.result_values()
+        try:
+            update_project_settings(
+                self.conn, self.current_project_id, values["enabled_views"],
+                values["use_start_dates"], values["use_end_dates"],
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "Could not save settings", str(e))
+            return
+        self.settings = get_project_settings(self.conn, self.current_project_id)
+        self._apply_settings_to_toolbar()
+        self.refresh_all_views()
+        # The open view may just have been switched off.
+        self.set_view(self._usable_view(self._current_view_key()))
+
+    def _current_view_key(self) -> str:
+        return self.VIEWS[self.content_stack.currentIndex()][0]
 
     def refresh_all_views(self) -> None:
         self.kanban_widget.refresh()
