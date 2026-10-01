@@ -13,6 +13,7 @@
 - Add, rename, reorder, and delete columns (behind an "Edit Board" mode)
 - Add, rename, reorder, and delete boards from the side panel (hamburger menu)
 - Tasks support notes, an optional due date, subtasks, and an optional link (e.g. a Joplin note)
+- Per-project settings (the "Settings" button on a project) to switch each view (Kanban, List, Missing Dates, Gantt, Calendar) on or off and to turn start dates and end (due) dates on or off; Gantt needs both dates, Calendar needs end dates, and dates already on tasks are kept when hidden
 - Global `Ctrl+Space` hotkey opens a quick-add dialog (with a board picker and a "Create multiple" option) from anywhere, even while Kanvas isn't focused
 - Data is stored locally in a SQLite database — no account or internet connection required
 
