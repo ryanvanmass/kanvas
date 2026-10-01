@@ -40,6 +40,15 @@ python3 kanvas.py
 
 On first run, a board named "My Board" is created automatically with four starter columns: Today, In Progress, Blocked, and Complete.
 
+## Running the tests
+
+```bash
+pip install -r requirements-dev.txt
+python3 -m pytest
+```
+
+The suite covers the data layer (boards, tasks, notes timeline, activity logs, projects, migrations) and includes offscreen GUI smoke tests that build the main dialogs without needing a display. On Linux, Qt's offscreen mode still needs a few system libraries (`libegl1`, `libgl1`, `libxkbcommon0`, `libfontconfig1`, `libdbus-1-3` on Debian/Ubuntu). A GitHub Actions workflow (`.github/workflows/tests.yml`) runs the same command on every push and pull request.
+
 ## Data storage
 
 Kanvas keeps its SQLite database outside the project folder, so your tasks persist across updates:

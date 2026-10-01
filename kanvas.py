@@ -34,7 +34,7 @@ import threading
 from datetime import datetime, date, timedelta, time as dt_time
 
 from PySide6.QtCore import Qt, QRect, QPoint, QDate, QTime, QDateTime, QTimer, QObject, Signal, QPropertyAnimation, QEasingCurve, QUrl
-from PySide6.QtGui import QIcon, QAction, QFont, QColor, QCursor, QPainter, QPen, QBrush, QFontMetrics, QDesktopServices
+from PySide6.QtGui import QIcon, QAction, QFont, QColor, QTextDocument, QCursor, QPainter, QPen, QBrush, QFontMetrics, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QListView, QComboBox,
@@ -2751,6 +2751,15 @@ QComboBox QAbstractItemView {{
 """
 
 
+def _markdown_to_html(markdown: str) -> str:
+    """Renders Markdown to HTML via Qt, recolouring links: Qt's default
+    link blue is unreadable on the dark theme, and QLabel's own Markdown
+    mode gives no way to change it (it ignores the palette)."""
+    doc = QTextDocument()
+    doc.setMarkdown(markdown)
+    return doc.toHtml().replace("color:#0000ff", "color:#8AB4F8")
+
+
 class _NoteComposerEdit(QTextEdit):
     """QTextEdit that emits submitted on Ctrl+Enter (plain Enter still
     inserts a newline, since notes are multi-line Markdown)."""
@@ -2798,6 +2807,7 @@ class NotesTimelineWidget(QWidget):
 
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._entries_host = QWidget()
         self._entries_layout = QVBoxLayout(self._entries_host)
         self._entries_layout.setContentsMargins(0, 0, 0, 0)
@@ -2843,6 +2853,9 @@ class NotesTimelineWidget(QWidget):
             stamp += f"  ·  edited {note['edited_at'].replace('T', ' ')}"
         stamp_label = QLabel(stamp)
         stamp_label.setStyleSheet("color: #888888; font-size: 11px;")
+        # Wrapping lets a long "edited ..." stamp shrink instead of pushing
+        # the Edit/Delete buttons past the card's right edge.
+        stamp_label.setWordWrap(True)
         header.addWidget(stamp_label)
         header.addStretch()
 
@@ -2854,7 +2867,7 @@ class NotesTimelineWidget(QWidget):
             header.addWidget(edit_btn)
             delete_btn = QPushButton("Delete")
             delete_btn.setFlat(True)
-            delete_btn.setStyleSheet("color: #b00000;")
+            delete_btn.setStyleSheet("color: #e05252;")
             delete_btn.clicked.connect(lambda checked=False, n=note["id"]: self._delete_note(n))
             header.addWidget(delete_btn)
         layout.addLayout(header)
@@ -2875,8 +2888,8 @@ class NotesTimelineWidget(QWidget):
             btn_row.addWidget(save_btn)
             layout.addLayout(btn_row)
         else:
-            body = QLabel(note["body"])
-            body.setTextFormat(Qt.MarkdownText)
+            body = QLabel(_markdown_to_html(note["body"]))
+            body.setTextFormat(Qt.RichText)
             body.setWordWrap(True)
             body.setTextInteractionFlags(Qt.TextBrowserInteraction)
             body.setOpenExternalLinks(True)
@@ -5736,6 +5749,7 @@ class NewProjectTaskDialog(QDialog):
     def result_values(self) -> dict:
         return {
             "title": self.title_edit.text().strip(),
+            "notes": self.notes_edit.toPlainText().strip(),
             "column_id": self.column_combo.currentData(),
             "start_date": self.start_date_edit.date().toString("yyyy-MM-dd") if self.start_date_check.isChecked() else "",
             "due_date": self.due_date_edit.date().toString("yyyy-MM-dd") if self.due_date_check.isChecked() else "",
@@ -6149,7 +6163,6 @@ class ProjectTaskCardDialog(QDialog):
     def result_values(self) -> dict:
         return {
             "title": self.title_edit.text().strip(),
-            "notes": self.notes_edit.toPlainText().strip(),
             "column_id": self.column_combo.currentData(),
             "start_date": self.start_date_edit.date().toString("yyyy-MM-dd") if self.start_date_check.isChecked() else "",
             "due_date": self.due_date_edit.date().toString("yyyy-MM-dd") if self.due_date_check.isChecked() else "",
