@@ -70,7 +70,20 @@ Pressing `Ctrl+Space` anywhere opens a quick-add dialog, regardless of whether K
 
 ## Building your own package
 
-There's no CI/release pipeline yet — these are manual, local build steps using [PyInstaller](https://pyinstaller.org/).
+### Automated builds
+
+The **Build** workflow (`.github/workflows/build.yml`) does all of this in GitHub Actions: it runs the tests, builds the Windows `.exe` and the Linux `.deb`/`.rpm`, and smoke-launches the Linux build headlessly to make sure it starts. Run it manually from the Actions tab to get downloadable artifacts, or push a version tag to also publish a GitHub Release with the files attached:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+The tag (minus the `v`) becomes the package version.
+
+### Building by hand
+
+The steps below are the manual equivalent, using [PyInstaller](https://pyinstaller.org/).
 
 ```bash
 pip install pyinstaller
