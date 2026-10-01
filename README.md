@@ -12,7 +12,11 @@
 - Drag-and-drop tasks between columns
 - Add, rename, reorder, and delete columns (behind an "Edit Board" mode)
 - Add, rename, reorder, and delete boards from the side panel (hamburger menu)
-- Tasks support notes, an optional due date, subtasks, and an optional link (e.g. a Joplin note)
+- Tasks support an optional due date, subtasks, and an optional link (e.g. a Joplin note)
+- Each task card has a **Notes** tab: a timeline of individual, timestamped notes (newest first) rendered as Markdown. Notes can be edited or deleted afterwards, and edited ones are marked
+- A per-board **Activity Log** records task created/edited/moved/completed/deleted, subtask and note events, with search plus action-type and date filters
+- Per-board task templates, scheduled automation rules (create or move tasks on a schedule), and a summary **Report**
+- **Projects**: separate from boards, with nested sub-boards under any task and Kanban, List, Gantt, and Calendar views, a Document Library, a progress rollup, a project-wide Activity Log, and whole-project duplication
 - Global `Ctrl+Space` hotkey opens a quick-add dialog (with a board picker and a "Create multiple" option) from anywhere, even while Kanvas isn't focused
 - Data is stored locally in a SQLite database — no account or internet connection required
 
@@ -44,6 +48,8 @@ Kanvas keeps its SQLite database outside the project folder, so your tasks persi
 |---------|--------------------------------------------|
 | Linux   | `~/.local/share/kanban_board/kanban.db`    |
 | Windows | `%APPDATA%\KanbanBoard\kanban.db`          |
+
+If you're upgrading from a version that kept a single notes field per task, each existing note is moved into that task's notes timeline automatically the first time you launch.
 
 ## Global quick-add hotkey
 
