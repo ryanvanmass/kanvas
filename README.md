@@ -12,7 +12,11 @@
 - Drag-and-drop tasks between columns
 - Add, rename, reorder, and delete columns (behind an "Edit Board" mode)
 - Add, rename, reorder, and delete boards from the side panel (hamburger menu)
-- Tasks support notes, an optional due date, subtasks, and an optional link (e.g. a Joplin note)
+- Tasks support an optional due date, subtasks, and an optional link (e.g. a Joplin note)
+- Each task card has a **Notes** tab: a timeline of individual, timestamped notes (newest first) rendered as Markdown. Notes can be edited or deleted afterwards, and edited ones are marked
+- A per-board **Activity Log** records task created/edited/moved/completed/deleted, subtask and note events, with search plus action-type and date filters
+- Per-board task templates, scheduled automation rules (create or move tasks on a schedule), and a summary **Report**
+- **Projects**: separate from boards, with nested sub-boards under any task and Kanban, List, Gantt, and Calendar views, a Document Library, a progress rollup, a project-wide Activity Log, and whole-project duplication
 - Global `Ctrl+Space` hotkey opens a quick-add dialog (with a board picker and a "Create multiple" option) from anywhere, even while Kanvas isn't focused
 - Data is stored locally in a SQLite database — no account or internet connection required
 
@@ -36,6 +40,15 @@ python3 kanvas.py
 
 On first run, a board named "My Board" is created automatically with four starter columns: Today, In Progress, Blocked, and Complete.
 
+## Running the tests
+
+```bash
+pip install -r requirements-dev.txt
+python3 -m pytest
+```
+
+The suite covers the data layer (boards, tasks, notes timeline, activity logs, projects, migrations) and includes offscreen GUI smoke tests that build the main dialogs without needing a display. On Linux, Qt's offscreen mode still needs a few system libraries (`libegl1`, `libgl1`, `libxkbcommon0`, `libfontconfig1`, `libdbus-1-3` on Debian/Ubuntu). A GitHub Actions workflow (`.github/workflows/tests.yml`) runs the same command on every push and pull request.
+
 ## Data storage
 
 Kanvas keeps its SQLite database outside the project folder, so your tasks persist across updates:
@@ -44,6 +57,8 @@ Kanvas keeps its SQLite database outside the project folder, so your tasks persi
 |---------|--------------------------------------------|
 | Linux   | `~/.local/share/kanban_board/kanban.db`    |
 | Windows | `%APPDATA%\KanbanBoard\kanban.db`          |
+
+If you're upgrading from a version that kept a single notes field per task, each existing note is moved into that task's notes timeline automatically the first time you launch.
 
 ## Global quick-add hotkey
 
@@ -55,7 +70,20 @@ Pressing `Ctrl+Space` anywhere opens a quick-add dialog, regardless of whether K
 
 ## Building your own package
 
-There's no CI/release pipeline yet — these are manual, local build steps using [PyInstaller](https://pyinstaller.org/).
+### Automated builds
+
+The **Build** workflow (`.github/workflows/build.yml`) does all of this in GitHub Actions: it runs the tests, builds the Windows `.exe` and the Linux `.deb`/`.rpm`, and smoke-launches the Linux build headlessly to make sure it starts. Run it manually from the Actions tab to get downloadable artifacts, or push a version tag to also publish a GitHub Release with the files attached:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+The tag (minus the `v`) becomes the package version.
+
+### Building by hand
+
+The steps below are the manual equivalent, using [PyInstaller](https://pyinstaller.org/).
 
 ```bash
 pip install pyinstaller
