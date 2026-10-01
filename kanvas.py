@@ -2592,6 +2592,15 @@ def _log_board_task_event(
     conn.commit()
 
 
+def get_board_activity_log_entries_for_task(conn: sqlite3.Connection, task_id: str) -> list:
+    """Per-task History tab - newest first, no filters. Only usable while
+    the task still exists; a deleted task's entries stay in the board log."""
+    rows = conn.execute(
+        "SELECT * FROM board_activity_log WHERE task_id = ? ORDER BY created_at DESC, rowid DESC", (task_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_board_activity_log_entries(
     conn: sqlite3.Connection, board_id: str, search_text: str = "",
     action_types: list = None, date_from: str = "", date_to: str = "",
@@ -2902,7 +2911,7 @@ class NotesTimelineWidget(QWidget):
 
 class TaskCardDialog(QDialog):
     """Full card view for a single task: title, status/column, due date,
-    Joplin note link, a Notes tab (timeline), a subtask checklist, and the created/updated
+    Joplin note link, a Notes tab (timeline), a History tab, a subtask checklist, and the created/updated
     timestamps, all in one dialog rather than the separate title-then-notes
     prompts this replaced.
 
@@ -2999,6 +3008,20 @@ class TaskCardDialog(QDialog):
             lambda note_id: delete_task_note(self.conn, note_id),
         )
         self.tabs.addTab(self.notes_timeline, "Notes")
+
+        history_tab = QWidget()
+        history_layout = QVBoxLayout(history_tab)
+        self.history_table = QTableWidget()
+        self.history_table.setColumnCount(3)
+        self.history_table.setHorizontalHeaderLabels(["Date", "Action", "Description"])
+        self.history_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.history_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.history_table.verticalHeader().setVisible(False)
+        self.history_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        history_layout.addWidget(self.history_table)
+        self.tabs.addTab(history_tab, "History")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self._refresh_history()
         outer_layout.addWidget(self.tabs)
 
         btn_row = QHBoxLayout()
@@ -3022,6 +3045,24 @@ class TaskCardDialog(QDialog):
             QMessageBox.warning(self, "Title required", "Task title cannot be empty.")
             return
         self.accept()
+
+    # -- history (read-only; subtasks and notes log as they happen, so
+    # it's reloaded whenever the tab is opened rather than only once) --
+
+    def _on_tab_changed(self, index: int) -> None:
+        if self.tabs.widget(index) is self.history_table.parentWidget():
+            self._refresh_history()
+
+    def _refresh_history(self) -> None:
+        action_labels = dict(ACTIVITY_ACTION_TYPES)
+        entries = get_board_activity_log_entries_for_task(self.conn, self.task_id)
+        self.history_table.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
+            self.history_table.setItem(row, 0, QTableWidgetItem(entry["created_at"]))
+            self.history_table.setItem(
+                row, 1, QTableWidgetItem(action_labels.get(entry["action_type"], entry["action_type"]))
+            )
+            self.history_table.setItem(row, 2, QTableWidgetItem(entry["description"]))
 
     # -- subtasks (write straight to the database, see class docstring) --
 
