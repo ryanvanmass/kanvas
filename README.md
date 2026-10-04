@@ -13,6 +13,10 @@
 - Add, rename, reorder, and delete columns (behind an "Edit Board" mode)
 - Add, rename, reorder, and delete boards from the side panel (hamburger menu)
 - Tasks support notes, an optional due date, subtasks, and an optional link (e.g. a Joplin note)
+- Colored tags (one shared list, managed from the "Tags" button) on board and project tasks, with a tag filter on each board
+- Mark a task cancelled with an optional note (hidden by default; use "Show Cancelled" to review them)
+- Right-click a task to mark it cancelled, delete it, or move it to another board (standard boards)
+- Global calendar (Calendar button / side panel) showing every dated task across all boards and projects
 - Global `Ctrl+Space` hotkey opens a quick-add dialog (with a board picker and a "Create multiple" option) from anywhere, even while Kanvas isn't focused
 - Data is stored locally in a SQLite database — no account or internet connection required
 

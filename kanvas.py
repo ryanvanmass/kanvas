@@ -42,7 +42,8 @@ from PySide6.QtWidgets import (
     QCheckBox, QDateEdit, QSpinBox, QMenu, QToolButton, QStackedWidget,
     QDateTimeEdit, QTimeEdit, QRadioButton, QButtonGroup, QSystemTrayIcon,
     QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea, QGridLayout, QSizePolicy,
-    QStyledItemDelegate, QTabWidget, QFileDialog, QProgressBar,
+    QStyledItemDelegate, QTabWidget, QFileDialog, QProgressBar, QStyleOptionViewItem,
+    QColorDialog,
 )
 
 APP_TITLE = "Kanvas"
@@ -187,6 +188,21 @@ def _migrate_task_completion_fields(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_task_cancelled_fields(conn: sqlite3.Connection) -> None:
+    """Adds cancelled/cancelled_note/cancelled_at to both "tasks" and
+    "project_tasks" for databases created before cancellation existed."""
+    for table in ("tasks", "project_tasks"):
+        if not _table_exists(conn, table):
+            continue
+        if not _table_has_column(conn, table, "cancelled"):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0")
+        if not _table_has_column(conn, table, "cancelled_note"):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN cancelled_note TEXT NOT NULL DEFAULT ''")
+        if not _table_has_column(conn, table, "cancelled_at"):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN cancelled_at TEXT NOT NULL DEFAULT ''")
+    conn.commit()
+
+
 def _migrate_legacy_single_board_schema(conn: sqlite3.Connection) -> None:
     """If this database was created by a pre-multi-board version of this
     app, its "columns" table has no board_id column and a single-column
@@ -273,7 +289,10 @@ def init_db(conn: sqlite3.Connection) -> None:
             due_date TEXT NOT NULL DEFAULT '',
             joplin_link TEXT NOT NULL DEFAULT '',
             completed INTEGER NOT NULL DEFAULT 0,
-            completed_at TEXT NOT NULL DEFAULT ''
+            completed_at TEXT NOT NULL DEFAULT '',
+            cancelled INTEGER NOT NULL DEFAULT 0,
+            cancelled_note TEXT NOT NULL DEFAULT '',
+            cancelled_at TEXT NOT NULL DEFAULT ''
         )
     """)
     conn.execute("""
@@ -382,7 +401,32 @@ def init_db(conn: sqlite3.Connection) -> None:
             completed INTEGER NOT NULL DEFAULT 0,
             position INTEGER NOT NULL,
             link TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            cancelled INTEGER NOT NULL DEFAULT 0,
+            cancelled_note TEXT NOT NULL DEFAULT '',
+            cancelled_at TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tags (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            color TEXT NOT NULL,
+            position INTEGER NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS task_tags (
+            task_id TEXT NOT NULL,
+            tag_id TEXT NOT NULL,
+            PRIMARY KEY (task_id, tag_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS project_task_tags (
+            task_id TEXT NOT NULL,
+            tag_id TEXT NOT NULL,
+            PRIMARY KEY (task_id, tag_id)
         )
     """)
     conn.execute("""
@@ -445,6 +489,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     _migrate_legacy_single_board_schema(conn)
     _migrate_task_card_fields(conn)
     _migrate_task_completion_fields(conn)
+    _migrate_task_cancelled_fields(conn)
 
     # Fresh install: no boards exist yet at all (migration only runs for
     # upgrades, so this is the true "never used before" case).
@@ -518,6 +563,10 @@ def delete_board(conn: sqlite3.Connection, board_id: str) -> None:
     if len(boards) <= 1:
         raise ValueError("At least one board must remain.")
 
+    conn.execute(
+        "DELETE FROM task_tags WHERE task_id IN (SELECT id FROM tasks WHERE board_id = ?)",
+        (board_id,),
+    )
     conn.execute("DELETE FROM tasks WHERE board_id = ?", (board_id,))
     conn.execute("DELETE FROM columns WHERE board_id = ?", (board_id,))
     conn.execute(
@@ -664,6 +713,130 @@ def move_column(conn: sqlite3.Connection, board_id: str, status: str, direction:
     conn.commit()
 
 
+# -- Tags (one global list shared by standard-board and project tasks) ----
+#
+# Tags themselves live in one table, but the task<->tag links are kept
+# per kind (task_tags / project_task_tags) so the two task families stay
+# as isolated as the rest of the schema. "kind" below is "board" or "project".
+
+TAG_COLORS = ["#4F46E5", "#0891b2", "#059669", "#d97706", "#db2777", "#7c3aed", "#dc2626", "#64748b"]
+
+_TAG_LINK_TABLES = {"board": "task_tags", "project": "project_task_tags"}
+_TAG_TASK_TABLES = {"board": "tasks", "project": "project_tasks"}
+
+
+def get_tags(conn: sqlite3.Connection) -> list:
+    rows = conn.execute("SELECT * FROM tags ORDER BY position ASC, name ASC").fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_tag(conn: sqlite3.Connection, name: str, color: str = None) -> dict:
+    name = name.strip()
+    if not name:
+        raise ValueError("Tag name cannot be empty.")
+    existing = conn.execute("SELECT * FROM tags WHERE name = ?", (name,)).fetchone()
+    if existing is not None:
+        return dict(existing)
+    max_row = conn.execute("SELECT MAX(position) AS m FROM tags").fetchone()
+    position = (max_row["m"] + 1) if max_row["m"] is not None else 0
+    if color is None:
+        color = TAG_COLORS[position % len(TAG_COLORS)]
+    tag_id = uuid.uuid4().hex
+    conn.execute(
+        "INSERT INTO tags (id, name, color, position) VALUES (?, ?, ?, ?)",
+        (tag_id, name, color, position),
+    )
+    conn.commit()
+    return dict(conn.execute("SELECT * FROM tags WHERE id = ?", (tag_id,)).fetchone())
+
+
+def update_tag(conn: sqlite3.Connection, tag_id: str, name: str, color: str) -> None:
+    name = name.strip()
+    if not name:
+        raise ValueError("Tag name cannot be empty.")
+    clash = conn.execute(
+        "SELECT id FROM tags WHERE name = ? AND id != ?", (name, tag_id)
+    ).fetchone()
+    if clash is not None:
+        raise ValueError(f'A tag named "{name}" already exists.')
+    conn.execute("UPDATE tags SET name = ?, color = ? WHERE id = ?", (name, color, tag_id))
+    conn.commit()
+
+
+def delete_tag(conn: sqlite3.Connection, tag_id: str) -> None:
+    for table in _TAG_LINK_TABLES.values():
+        conn.execute(f"DELETE FROM {table} WHERE tag_id = ?", (tag_id,))
+    conn.execute("DELETE FROM tags WHERE id = ?", (tag_id,))
+    conn.commit()
+
+
+def get_task_tags(conn: sqlite3.Connection, task_id: str, kind: str = "board") -> list:
+    link = _TAG_LINK_TABLES[kind]
+    rows = conn.execute(
+        f"SELECT t.* FROM tags t JOIN {link} l ON l.tag_id = t.id "
+        f"WHERE l.task_id = ? ORDER BY t.position ASC, t.name ASC",
+        (task_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_task_tags_map(conn: sqlite3.Connection, task_ids: list, kind: str = "board") -> dict:
+    """{task_id: [tag dict, ...]} in one query, so a board refresh doesn't
+    pay one query per card."""
+    if not task_ids:
+        return {}
+    link = _TAG_LINK_TABLES[kind]
+    result = {}
+    # Chunked to stay under SQLite's bound-variable limit.
+    for start in range(0, len(task_ids), 500):
+        chunk = task_ids[start:start + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT l.task_id AS task_id, t.* FROM {link} l JOIN tags t ON t.id = l.tag_id "
+            f"WHERE l.task_id IN ({placeholders}) ORDER BY t.position ASC, t.name ASC",
+            chunk,
+        ).fetchall()
+        for r in rows:
+            tag = {k: r[k] for k in ("id", "name", "color", "position")}
+            result.setdefault(r["task_id"], []).append(tag)
+    return result
+
+
+def _attach_tags(conn: sqlite3.Connection, tasks: list, kind: str) -> list:
+    tag_map = get_task_tags_map(conn, [t["id"] for t in tasks], kind)
+    for task in tasks:
+        task["tags"] = tag_map.get(task["id"], [])
+    return tasks
+
+
+def set_task_tags(
+    conn: sqlite3.Connection, task_id: str, tag_ids: list, kind: str = "board",
+) -> None:
+    """Replaces the task's tag set. Logs a single tags_changed entry when
+    the set actually differs from what was there."""
+    link = _TAG_LINK_TABLES[kind]
+    old_tags = get_task_tags(conn, task_id, kind)
+    old_ids = {t["id"] for t in old_tags}
+    new_ids = set(tag_ids)
+    if old_ids == new_ids:
+        return
+    conn.execute(f"DELETE FROM {link} WHERE task_id = ?", (task_id,))
+    for tag_id in new_ids:
+        conn.execute(f"INSERT INTO {link} (task_id, tag_id) VALUES (?, ?)", (task_id, tag_id))
+    conn.commit()
+
+    task = get_task(conn, task_id) if kind == "board" else get_project_task(conn, task_id)
+    if task is None:
+        return
+    old_names = ", ".join(t["name"] for t in old_tags) or "(none)"
+    new_names = ", ".join(t["name"] for t in get_task_tags(conn, task_id, kind)) or "(none)"
+    logger = _log_board_task_event if kind == "board" else _log_task_event
+    logger(
+        conn, task, "tags_changed", f"Changed Tags from {old_names} to {new_names}",
+        field_name="tags", old_value=old_names, new_value=new_names,
+    )
+
+
 # -- Tasks (looked up by their own id once created; add/list need board_id) --
 
 def add_task(
@@ -698,7 +871,7 @@ def get_tasks_by_status(conn: sqlite3.Connection, board_id: str, status: str) ->
         "SELECT * FROM tasks WHERE board_id = ? AND status = ? ORDER BY updated DESC",
         (board_id, status),
     ).fetchall()
-    return [dict(r) for r in rows]
+    return _attach_tags(conn, [dict(r) for r in rows], "board")
 
 
 def update_task(
@@ -773,12 +946,90 @@ def set_task_completed(conn: sqlite3.Connection, task_id: str, completed: bool) 
     )
 
 
+def set_task_cancelled(
+    conn: sqlite3.Connection, task_id: str, cancelled: bool, note: str = "",
+) -> None:
+    """Cancellation is tracked independently of both column and
+    completion. Reopening clears the note."""
+    task = get_task(conn, task_id)
+    if task is None:
+        return
+    note = note.strip() if cancelled else ""
+    now = _now()
+    conn.execute(
+        "UPDATE tasks SET cancelled = ?, cancelled_note = ?, cancelled_at = ?, updated = ? WHERE id = ?",
+        (1 if cancelled else 0, note, now if cancelled else "", now, task_id),
+    )
+    conn.commit()
+
+    was_cancelled = bool(task["cancelled"])
+    if was_cancelled == cancelled and (task["cancelled_note"] or "") == note:
+        return
+    if cancelled:
+        description = f"Marked cancelled: {note}" if note else "Marked cancelled"
+    else:
+        description = "Reopened (no longer cancelled)"
+    _log_board_task_event(
+        conn, task, "cancelled" if cancelled else "uncancelled", description,
+        new_value=note or None,
+    )
+
+
+def move_task_to_board(
+    conn: sqlite3.Connection, task_id: str, new_board_id: str, new_status: str = None,
+) -> None:
+    """Moves a task (with its subtasks and tags, which are keyed by task
+    id) to another standard board. Keeps the column if the target board
+    has one with the same status slug, otherwise lands in the target's
+    first column. Logged on both boards so each board's Activity Log
+    tells the story."""
+    task = get_task(conn, task_id)
+    if task is None:
+        raise ValueError("Task not found.")
+    if task["board_id"] == new_board_id:
+        raise ValueError("The task is already on that board.")
+    target_board = get_board(conn, new_board_id)
+    if target_board is None:
+        raise ValueError("Target board not found.")
+    target_columns = get_columns(conn, new_board_id)
+    if not target_columns:
+        raise ValueError("The target board has no columns to move the task into.")
+
+    valid_statuses = {c["status"] for c in target_columns}
+    if new_status is None:
+        new_status = task["status"] if task["status"] in valid_statuses else target_columns[0]["status"]
+    elif new_status not in valid_statuses:
+        raise ValueError("That column does not exist on the target board.")
+
+    source_board = get_board(conn, task["board_id"])
+    source_name = source_board["name"] if source_board else "?"
+    target_name = target_board["name"]
+    new_column_name = next(c["name"] for c in target_columns if c["status"] == new_status)
+
+    # Log "away" against the source board while the task still points at it.
+    _log_board_task_event(
+        conn, task, "board_moved", f'Moved to board "{target_name}"',
+        old_value=source_name, new_value=target_name,
+    )
+    conn.execute(
+        "UPDATE tasks SET board_id = ?, status = ?, updated = ? WHERE id = ?",
+        (new_board_id, new_status, _now(), task_id),
+    )
+    conn.commit()
+    _log_board_task_event(
+        conn, get_task(conn, task_id), "board_moved",
+        f'Moved from board "{source_name}" into "{new_column_name}"',
+        old_value=source_name, new_value=target_name,
+    )
+
+
 def delete_task(conn: sqlite3.Connection, task_id: str) -> None:
     task = get_task(conn, task_id)
     if task is not None:
         _log_board_task_event(conn, task, "deleted", f'Deleted "{task["title"]}"')
     conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
     conn.execute("DELETE FROM subtasks WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_tags WHERE task_id = ?", (task_id,))
     conn.commit()
 
 
@@ -1351,7 +1602,7 @@ def get_board_report(conn: sqlite3.Connection, board_id: str) -> dict:
         column_counts.append({"name": col["name"], "status": col["status"], "count": len(tasks)})
         total_tasks += len(tasks)
         for task in tasks:
-            if task["due_date"] and task["due_date"] < today_str:
+            if task["due_date"] and task["due_date"] < today_str and not task["cancelled"]:
                 overdue_count += 1
             if task["created"] >= recent_cutoff:
                 recent_count += 1
@@ -1826,6 +2077,11 @@ def delete_project_board(conn: sqlite3.Connection, board_id: str) -> None:
         f"(SELECT id FROM project_tasks WHERE board_id IN ({placeholders}))",
         board_ids,
     )
+    conn.execute(
+        f"DELETE FROM project_task_tags WHERE task_id IN "
+        f"(SELECT id FROM project_tasks WHERE board_id IN ({placeholders}))",
+        board_ids,
+    )
     conn.execute(f"DELETE FROM project_tasks WHERE board_id IN ({placeholders})", board_ids)
     conn.execute(f"DELETE FROM project_columns WHERE board_id IN ({placeholders})", board_ids)
     conn.execute(f"DELETE FROM project_boards WHERE id IN ({placeholders})", board_ids)
@@ -1962,7 +2218,7 @@ def get_project_tasks_for_column(conn: sqlite3.Connection, board_id: str, column
         "SELECT * FROM project_tasks WHERE board_id = ? AND column_id = ? ORDER BY position ASC",
         (board_id, column_id),
     ).fetchall()
-    return [dict(r) for r in rows]
+    return _attach_tags(conn, [dict(r) for r in rows], "project")
 
 
 def get_project_tasks_for_board(conn: sqlite3.Connection, board_id: str) -> list:
@@ -1970,7 +2226,7 @@ def get_project_tasks_for_board(conn: sqlite3.Connection, board_id: str) -> list
     rows = conn.execute(
         "SELECT * FROM project_tasks WHERE board_id = ? ORDER BY position ASC", (board_id,)
     ).fetchall()
-    return [dict(r) for r in rows]
+    return _attach_tags(conn, [dict(r) for r in rows], "project")
 
 
 def get_missing_dates_tasks(conn: sqlite3.Connection, board_id: str) -> list:
@@ -2013,6 +2269,66 @@ def get_calendar_project_tasks(conn: sqlite3.Connection, board_id: str) -> list:
         (board_id,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_global_calendar_items(
+    conn: sqlite3.Connection, include_completed: bool = True, include_cancelled: bool = False,
+) -> list:
+    """Everything with a date, across every standard board and every
+    project board - feeds the global Calendar. Standard tasks only have a
+    due_date so they sit on a single day; project tasks with both dates
+    span start..due, and a due-only project task is a single day. Items
+    missing a due date never appear (same rule as the per-project
+    Calendar). Each item carries "source_id" (board or project-board id)
+    and "source_name" so the UI can color and label by origin.
+
+    Dict keys: kind ("board"/"project"), id, title, start, end, board_id
+    (the board the task lives on - a project sub-board for project tasks),
+    source_id, source_name, completed, cancelled, tags."""
+    items = []
+
+    rows = conn.execute(
+        "SELECT t.*, b.name AS board_name FROM tasks t JOIN boards b ON b.id = t.board_id "
+        "WHERE t.due_date IS NOT NULL AND t.due_date != '' ORDER BY t.due_date ASC"
+    ).fetchall()
+    tasks = _attach_tags(conn, [dict(r) for r in rows], "board")
+    for t in tasks:
+        items.append({
+            "kind": "board", "id": t["id"], "title": t["title"],
+            "start": t["due_date"], "end": t["due_date"],
+            "board_id": t["board_id"],
+            "source_id": t["board_id"], "source_name": t["board_name"],
+            "completed": bool(t["completed"]), "cancelled": bool(t["cancelled"]),
+            "tags": t["tags"],
+        })
+
+    rows = conn.execute(
+        "SELECT t.*, pb.project_id AS project_id, p.name AS project_name, pb.name AS board_name "
+        "FROM project_tasks t "
+        "JOIN project_boards pb ON pb.id = t.board_id "
+        "JOIN projects p ON p.id = pb.project_id "
+        "WHERE t.due_date IS NOT NULL AND t.due_date != '' ORDER BY t.due_date ASC"
+    ).fetchall()
+    ptasks = _attach_tags(conn, [dict(r) for r in rows], "project")
+    for t in ptasks:
+        start = t["start_date"] or t["due_date"]
+        if start > t["due_date"]:
+            start = t["due_date"]
+        items.append({
+            "kind": "project", "id": t["id"], "title": t["title"],
+            "start": start, "end": t["due_date"],
+            "board_id": t["board_id"],
+            "source_id": t["project_id"], "source_name": t["project_name"],
+            "completed": bool(t["completed"]), "cancelled": bool(t["cancelled"]),
+            "tags": t["tags"],
+        })
+
+    if not include_completed:
+        items = [i for i in items if not i["completed"]]
+    if not include_cancelled:
+        items = [i for i in items if not i["cancelled"]]
+    items.sort(key=lambda i: (i["start"], i["end"], i["title"].lower()))
+    return items
 
 
 def get_latest_due_date(conn: sqlite3.Connection, board_id: str, exclude_task_id: str = None):
@@ -2109,6 +2425,31 @@ def set_project_task_completed(conn: sqlite3.Connection, task_id: str, completed
     _log_task_event(conn, task, action_type, description)
 
 
+def set_project_task_cancelled(
+    conn: sqlite3.Connection, task_id: str, cancelled: bool, note: str = "",
+) -> None:
+    task = get_project_task(conn, task_id)
+    if task is None:
+        return
+    note = note.strip() if cancelled else ""
+    conn.execute(
+        "UPDATE project_tasks SET cancelled = ?, cancelled_note = ?, cancelled_at = ? WHERE id = ?",
+        (1 if cancelled else 0, note, _now() if cancelled else "", task_id),
+    )
+    conn.commit()
+
+    if bool(task["cancelled"]) == cancelled and (task["cancelled_note"] or "") == note:
+        return
+    if cancelled:
+        description = f"Marked cancelled: {note}" if note else "Marked cancelled"
+    else:
+        description = "Reopened (no longer cancelled)"
+    _log_task_event(
+        conn, task, "cancelled" if cancelled else "uncancelled", description,
+        new_value=note or None,
+    )
+
+
 def move_project_task(conn: sqlite3.Connection, task_id: str, new_column_id: str) -> None:
     task = get_project_task(conn, task_id)
     if task is None:
@@ -2150,6 +2491,7 @@ def delete_project_task(conn: sqlite3.Connection, task_id: str) -> None:
     if subboard is not None:
         delete_project_board(conn, subboard["id"])
     conn.execute("DELETE FROM project_subtasks WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM project_task_tags WHERE task_id = ?", (task_id,))
     conn.execute("DELETE FROM project_tasks WHERE id = ?", (task_id,))
     conn.commit()
 
@@ -2283,6 +2625,10 @@ ACTIVITY_ACTION_TYPES = [
     ("subtask_done", "Subtask checked/unchecked"),
     ("subtask_removed", "Subtask removed"),
     ("subboard_created", "Sub-board created"),
+    ("cancelled", "Cancelled"),
+    ("uncancelled", "Reopened"),
+    ("tags_changed", "Tags changed"),
+    ("board_moved", "Moved to another board"),
     ("deleted", "Deleted"),
 ]
 
@@ -2413,6 +2759,8 @@ _BOARD_ACTIVITY_FIELD_LABELS = {
 }
 
 BOARD_ACTIVITY_ACTION_TYPES = [a for a in ACTIVITY_ACTION_TYPES if a[0] != "subboard_created"]
+# Projects never move tasks between boards, so that action is board-only.
+PROJECT_ACTIVITY_ACTION_TYPES = [a for a in ACTIVITY_ACTION_TYPES if a[0] != "board_moved"]
 
 
 def _log_board_task_event(
@@ -2582,6 +2930,295 @@ QComboBox QAbstractItemView {{
 """
 
 
+# -- Shared tag / cancel widgets (used by both Boards and Projects) -------
+
+TAGS_ROLE = Qt.UserRole + 1   # list of {"name", "color"} dicts on a card's QListWidgetItem
+
+
+def _tag_chip_stylesheet(color: str, filled: bool) -> str:
+    if filled:
+        return (
+            f"QPushButton {{ background: {color}; color: white; border: 1px solid {color}; "
+            f"border-radius: 9px; padding: 1px 8px; }}"
+        )
+    return (
+        f"QPushButton {{ background: transparent; color: {color}; border: 1px solid {color}; "
+        f"border-radius: 9px; padding: 1px 8px; }}"
+    )
+
+
+class TagPickerWidget(QWidget):
+    """Row(s) of toggleable tag chips plus a "+ New tag" button. Selection
+    is only read back through selected_ids() - nothing is written to a
+    task here, the owning dialog applies it on Save. A brand-new tag IS
+    created immediately though (it's global, not per-task) and starts
+    selected."""
+
+    COLUMNS = 3
+
+    def __init__(self, conn: sqlite3.Connection, selected_ids=None, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self._selected = set(selected_ids or [])
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setMaximumHeight(90)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        self._container = QWidget()
+        self._grid = QGridLayout(self._container)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        scroll.setWidget(self._container)
+        outer.addWidget(scroll)
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        while self._grid.count():
+            widget = self._grid.takeAt(0).widget()
+            if widget is not None:
+                widget.hide()
+                widget.deleteLater()
+        index = 0
+        for tag in get_tags(self.conn):
+            btn = QPushButton(tag["name"])
+            btn.setCheckable(True)
+            btn.setChecked(tag["id"] in self._selected)
+            btn.setStyleSheet(_tag_chip_stylesheet(tag["color"], btn.isChecked()))
+            btn.toggled.connect(lambda checked, t=tag, b=btn: self._on_toggled(t, b, checked))
+            self._grid.addWidget(btn, index // self.COLUMNS, index % self.COLUMNS)
+            index += 1
+        new_btn = QPushButton("+ New tag")
+        new_btn.setProperty("compact", True)
+        new_btn.clicked.connect(self._new_tag)
+        self._grid.addWidget(new_btn, index // self.COLUMNS, index % self.COLUMNS)
+        self._grid.setColumnStretch(self.COLUMNS, 1)
+
+    def _on_toggled(self, tag: dict, btn: QPushButton, checked: bool) -> None:
+        if checked:
+            self._selected.add(tag["id"])
+        else:
+            self._selected.discard(tag["id"])
+        btn.setStyleSheet(_tag_chip_stylesheet(tag["color"], checked))
+
+    def _new_tag(self) -> None:
+        name, ok = QInputDialog.getText(self, "New Tag", "Tag name:")
+        if not ok or not name.strip():
+            return
+        try:
+            tag = add_tag(self.conn, name)
+        except ValueError as e:
+            QMessageBox.warning(self, "Could not add tag", str(e))
+            return
+        self._selected.add(tag["id"])
+        self._rebuild()
+
+    def selected_ids(self) -> list:
+        existing = {t["id"] for t in get_tags(self.conn)}
+        return [i for i in self._selected if i in existing]
+
+
+class ManageTagsDialog(QDialog):
+    """Rename / recolor / delete the global tag list."""
+
+    def __init__(self, conn: sqlite3.Connection, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.setWindowTitle("Manage Tags")
+        self.resize(360, 420)
+
+        layout = QVBoxLayout(self)
+        self.list_widget = QListWidget()
+        self.list_widget.itemDoubleClicked.connect(lambda _item: self._rename())
+        layout.addWidget(self.list_widget, stretch=1)
+
+        row = QHBoxLayout()
+        for text, handler in (
+            ("Add", self._add), ("Rename", self._rename),
+            ("Color…", self._recolor), ("Delete", self._delete),
+        ):
+            btn = QPushButton(text)
+            btn.clicked.connect(handler)
+            row.addWidget(btn)
+        layout.addLayout(row)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        self.list_widget.clear()
+        for tag in get_tags(self.conn):
+            item = QListWidgetItem(f"●  {tag['name']}")
+            item.setForeground(QColor(tag["color"]))
+            item.setData(Qt.UserRole, tag["id"])
+            self.list_widget.addItem(item)
+
+    def _current_tag(self):
+        item = self.list_widget.currentItem()
+        if item is None:
+            return None
+        tag_id = item.data(Qt.UserRole)
+        return next((t for t in get_tags(self.conn) if t["id"] == tag_id), None)
+
+    def _add(self) -> None:
+        name, ok = QInputDialog.getText(self, "New Tag", "Tag name:")
+        if not ok or not name.strip():
+            return
+        try:
+            add_tag(self.conn, name)
+        except ValueError as e:
+            QMessageBox.warning(self, "Could not add tag", str(e))
+        self._refresh()
+
+    def _rename(self) -> None:
+        tag = self._current_tag()
+        if tag is None:
+            return
+        name, ok = QInputDialog.getText(self, "Rename Tag", "Tag name:", text=tag["name"])
+        if not ok or not name.strip():
+            return
+        try:
+            update_tag(self.conn, tag["id"], name, tag["color"])
+        except ValueError as e:
+            QMessageBox.warning(self, "Could not rename tag", str(e))
+        self._refresh()
+
+    def _recolor(self) -> None:
+        tag = self._current_tag()
+        if tag is None:
+            return
+        color = QColorDialog.getColor(QColor(tag["color"]), self, "Tag color")
+        if not color.isValid():
+            return
+        update_tag(self.conn, tag["id"], tag["name"], color.name())
+        self._refresh()
+
+    def _delete(self) -> None:
+        tag = self._current_tag()
+        if tag is None:
+            return
+        reply = QMessageBox.question(
+            self, "Delete tag",
+            f'Delete the "{tag["name"]}" tag? It will be removed from every task.',
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            delete_tag(self.conn, tag["id"])
+            self._refresh()
+
+
+class TaskCardDelegate(QStyledItemDelegate):
+    """Default card painting (checkbox + title/meta text) with a row of
+    colored tag chips reserved underneath. Chip data rides on the item
+    under TAGS_ROLE; cards without tags are painted and sized exactly as
+    before."""
+
+    CHIP_HEIGHT = 16
+    CHIP_GAP = 4
+    LEFT_PAD = 28   # roughly clears the completion checkbox
+
+    def _chip_font(self, option) -> QFont:
+        font = QFont(option.font)
+        font.setPointSizeF(max(font.pointSizeF() - 1.5, 6.0))
+        return font
+
+    def _layout_chips(self, option, tags: list, width: int):
+        """Returns ([(x, y, w, tag), ...], total_height) relative to the
+        reserved area's top-left, wrapping onto new rows as needed."""
+        fm = QFontMetrics(self._chip_font(option))
+        x, y = self.LEFT_PAD, 2
+        placed = []
+        max_x = max(width - 6, self.LEFT_PAD + 40)
+        for tag in tags:
+            w = fm.horizontalAdvance(tag["name"]) + 14
+            if x + w > max_x and x > self.LEFT_PAD:
+                x = self.LEFT_PAD
+                y += self.CHIP_HEIGHT + self.CHIP_GAP
+            placed.append((x, y, w, tag))
+            x += w + self.CHIP_GAP
+        return placed, y + self.CHIP_HEIGHT + 4
+
+    def sizeHint(self, option, index):
+        size = super().sizeHint(option, index)
+        tags = index.data(TAGS_ROLE) or []
+        if tags:
+            _, height = self._layout_chips(option, tags, option.rect.width() or size.width() or 200)
+            size.setHeight(size.height() + height)
+        return size
+
+    def paint(self, painter, option, index):
+        tags = index.data(TAGS_ROLE) or []
+        if not tags:
+            super().paint(painter, option, index)
+            return
+        placed, chips_height = self._layout_chips(option, tags, option.rect.width())
+        base_option = QStyleOptionViewItem(option)
+        base_option.rect = option.rect.adjusted(0, 0, 0, -chips_height)
+        super().paint(painter, base_option, index)
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setFont(self._chip_font(option))
+        top = option.rect.bottom() - chips_height + 1
+        for x, y, w, tag in placed:
+            rect = QRect(option.rect.left() + x, top + y, w, self.CHIP_HEIGHT)
+            color = QColor(tag["color"])
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(color))
+            painter.drawRoundedRect(rect, 8, 8)
+            painter.setPen(QColor("white"))
+            painter.drawText(rect, Qt.AlignCenter, tag["name"])
+        painter.restore()
+
+
+def build_cancel_row(layout, task: dict):
+    """Adds a "Cancelled" checkbox + optional note line to a task dialog's
+    layout. Returns (check, note_edit); the note is only editable while
+    the box is ticked."""
+    check = QCheckBox("Cancelled")
+    check.setChecked(bool(task.get("cancelled")))
+    check.setToolTip(
+        "Hides this task from the board by default (like Completed) - "
+        "use \"Show Cancelled\" to review it again."
+    )
+    layout.addWidget(check)
+    note_edit = QLineEdit(task.get("cancelled_note") or "")
+    note_edit.setPlaceholderText("Optional note - why was this cancelled?")
+    note_edit.setEnabled(check.isChecked())
+    check.toggled.connect(note_edit.setEnabled)
+    layout.addWidget(note_edit)
+    return check, note_edit
+
+
+def prompt_cancel_note(parent, title: str):
+    """Asks for the optional cancellation note. Returns the note text
+    ("" is fine), or None if the user backed out."""
+    note, ok = QInputDialog.getText(
+        parent, "Mark Cancelled", f'Note for cancelling "{title}" (optional):'
+    )
+    return note.strip() if ok else None
+
+
+def apply_card_state(item: QListWidgetItem, task: dict) -> None:
+    """Shared card styling for tags + cancelled state, used by both
+    KanbanBoard.refresh and ProjectKanbanWidget.refresh."""
+    item.setData(TAGS_ROLE, task.get("tags") or [])
+    if task.get("cancelled"):
+        font = item.font()
+        font.setStrikeOut(True)
+        item.setFont(font)
+        item.setForeground(QColor("#767676"))
+        item.setText("✕ " + item.text())
+        tip = "Cancelled"
+        if task.get("cancelled_note"):
+            tip += f": {task['cancelled_note']}"
+        existing = item.toolTip()
+        item.setToolTip(f"{tip}\n{existing}" if existing else tip)
+
+
 class TaskCardDialog(QDialog):
     """Full card view for a single task: title, status/column, due date,
     Joplin note link, notes, a subtask checklist, and the created/updated
@@ -2599,7 +3236,7 @@ class TaskCardDialog(QDialog):
         self.conn = conn
         self.task_id = task["id"]
         self.setWindowTitle(task["title"])
-        self.resize(440, 620)
+        self.resize(440, 760)
         self.delete_requested = False
 
         layout = QVBoxLayout(self)
@@ -2625,6 +3262,14 @@ class TaskCardDialog(QDialog):
             "see the \"Show Completed\" toggle to review it again."
         )
         layout.addWidget(self.completed_check)
+
+        self.cancelled_check, self.cancelled_note_edit = build_cancel_row(layout, task)
+
+        layout.addWidget(QLabel("Tags"))
+        self.tag_picker = TagPickerWidget(
+            conn, [t["id"] for t in get_task_tags(conn, task["id"], "board")]
+        )
+        layout.addWidget(self.tag_picker)
 
         layout.addWidget(QLabel("Due Date"))
         due_row = QHBoxLayout()
@@ -2744,6 +3389,9 @@ class TaskCardDialog(QDialog):
             "due_date": due_date,
             "joplin_link": self.joplin_link_edit.text().strip(),
             "completed": self.completed_check.isChecked(),
+            "cancelled": self.cancelled_check.isChecked(),
+            "cancelled_note": self.cancelled_note_edit.text().strip(),
+            "tag_ids": self.tag_picker.selected_ids(),
         }
 
 
@@ -2752,10 +3400,10 @@ class NewTaskDialog(QDialog):
     TaskCardDialog's edit form (title/status/due date/Joplin link/notes)
     instead of the sequence of plain input-box prompts this replaced."""
 
-    def __init__(self, columns: list, default_status: str, parent=None, prefill: dict = None):
+    def __init__(self, columns: list, default_status: str, parent=None, prefill: dict = None, conn=None):
         super().__init__(parent)
         self.setWindowTitle("New Task")
-        self.resize(420, 420)
+        self.resize(420, 500)
         prefill = prefill or {}
 
         layout = QVBoxLayout(self)
@@ -2774,6 +3422,12 @@ class NewTaskDialog(QDialog):
         )
         self.status_combo.setCurrentIndex(default_idx)
         layout.addWidget(self.status_combo)
+
+        self.tag_picker = None
+        if conn is not None:
+            layout.addWidget(QLabel("Tags"))
+            self.tag_picker = TagPickerWidget(conn)
+            layout.addWidget(self.tag_picker)
 
         layout.addWidget(QLabel("Due Date"))
         due_row = QHBoxLayout()
@@ -2828,6 +3482,7 @@ class NewTaskDialog(QDialog):
             "status": self.status_combo.currentData(),
             "due_date": due_date,
             "joplin_link": self.joplin_link_edit.text().strip(),
+            "tag_ids": self.tag_picker.selected_ids() if self.tag_picker is not None else [],
         }
 
 
@@ -4113,6 +4768,7 @@ class TaskListWidget(QListWidget):
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_context_menu)
         self.itemChanged.connect(self._on_item_changed)
+        self.setItemDelegate(TaskCardDelegate(self))
 
     def _on_double_click(self, item):
         task_id = item.data(Qt.UserRole)
@@ -4277,6 +4933,16 @@ class BoardSidePanel(QWidget):
         close_btn.clicked.connect(self.board.close_board_panel)
         header_row.addWidget(close_btn)
         layout.addLayout(header_row)
+
+        calendar_btn = QPushButton("📅  Calendar (all boards)")
+        calendar_btn.setFlat(True)
+        calendar_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; text-align: left; "
+            "padding: 8px 16px; color: #e8e8e8; }"
+            "QPushButton:hover { background-color: #2c2e33; }"
+        )
+        calendar_btn.clicked.connect(self.board.open_calendar_from_panel)
+        layout.addWidget(calendar_btn)
 
         my_boards_label = QLabel("MY BOARDS")
         my_boards_label.setStyleSheet(
@@ -4496,8 +5162,11 @@ class KanbanBoard(QWidget):
         self._board_panel_anim = None
         self._quick_add_dialog = None
         self.show_completed = False
+        self.show_cancelled = False
+        self.tag_filter_id = None
         self._projects_cache = get_projects(self.conn)
         self._open_project_callback = None
+        self._open_calendar_callback = None
 
         outer = QVBoxLayout(self)
 
@@ -4534,6 +5203,11 @@ class KanbanBoard(QWidget):
         self.activity_log_btn.clicked.connect(self.show_activity_log_ui)
         toolbar.addWidget(self.activity_log_btn)
 
+        self.calendar_btn = QPushButton("Calendar")
+        self.calendar_btn.setToolTip("Calendar of everything with a date, across all boards and projects")
+        self.calendar_btn.clicked.connect(self.open_calendar)
+        toolbar.addWidget(self.calendar_btn)
+
         toolbar.addStretch()
 
         self.add_col_btn = QPushButton("+ Column")
@@ -4548,6 +5222,25 @@ class KanbanBoard(QWidget):
         )
         self.show_completed_btn.toggled.connect(self._on_show_completed_toggled)
         toolbar.addWidget(self.show_completed_btn)
+
+        self.show_cancelled_btn = QPushButton("Show Cancelled")
+        self.show_cancelled_btn.setCheckable(True)
+        self.show_cancelled_btn.setToolTip(
+            "Cancelled tasks are hidden from their column by default - toggle this to review them"
+        )
+        self.show_cancelled_btn.toggled.connect(self._on_show_cancelled_toggled)
+        toolbar.addWidget(self.show_cancelled_btn)
+
+        self.tag_filter_combo = QComboBox()
+        self.tag_filter_combo.setToolTip("Only show tasks with this tag")
+        self.tag_filter_combo.currentIndexChanged.connect(self._on_tag_filter_changed)
+        toolbar.addWidget(self.tag_filter_combo)
+
+        self.manage_tags_btn = QPushButton("Tags")
+        self.manage_tags_btn.setToolTip("Create, rename, recolor or delete tags")
+        self.manage_tags_btn.clicked.connect(self.manage_tags_ui)
+        toolbar.addWidget(self.manage_tags_btn)
+        self._rebuild_tag_filter()
 
         self.edit_board_btn = QPushButton("Edit Board")
         self.edit_board_btn.setCheckable(True)
@@ -4645,6 +5338,17 @@ class KanbanBoard(QWidget):
     def set_open_project_callback(self, callback) -> None:
         self._open_project_callback = callback
 
+    def set_open_calendar_callback(self, callback) -> None:
+        self._open_calendar_callback = callback
+
+    def open_calendar(self) -> None:
+        if self._open_calendar_callback is not None:
+            self._open_calendar_callback()
+
+    def open_calendar_from_panel(self) -> None:
+        self.close_board_panel()
+        self.open_calendar()
+
     def select_project_from_panel(self, project_id: str) -> None:
         if self._open_project_callback is not None:
             self._open_project_callback(project_id)
@@ -4734,16 +5438,48 @@ class KanbanBoard(QWidget):
         self.show_completed = checked
         self.refresh()
 
+    def _on_show_cancelled_toggled(self, checked: bool) -> None:
+        self.show_cancelled = checked
+        self.refresh()
+
+    def _rebuild_tag_filter(self) -> None:
+        self.tag_filter_combo.blockSignals(True)
+        self.tag_filter_combo.clear()
+        self.tag_filter_combo.addItem("All tags", None)
+        for tag in get_tags(self.conn):
+            self.tag_filter_combo.addItem(tag["name"], tag["id"])
+        idx = self.tag_filter_combo.findData(self.tag_filter_id)
+        if idx < 0:
+            self.tag_filter_id = None
+            idx = 0
+        self.tag_filter_combo.setCurrentIndex(idx)
+        self.tag_filter_combo.blockSignals(False)
+
+    def _on_tag_filter_changed(self, _index: int) -> None:
+        self.tag_filter_id = self.tag_filter_combo.currentData()
+        self.refresh()
+
+    def manage_tags_ui(self) -> None:
+        ManageTagsDialog(self.conn, self).exec()
+        self._rebuild_tag_filter()
+        self.refresh()
+
     # -- lightweight refresh (task list contents only) ------------------
 
     def refresh(self) -> None:
+        self._rebuild_tag_filter()  # a dialog may have just created a tag
         for status, col_widget in self.columns.items():
             list_widget = col_widget.list_widget
             list_widget.blockSignals(True)
             list_widget.clear()
 
             all_tasks = get_tasks_by_status(self.conn, self.current_board_id, status)
-            tasks = all_tasks if self.show_completed else [t for t in all_tasks if not t["completed"]]
+            tasks = [
+                t for t in all_tasks
+                if (self.show_completed or not t["completed"])
+                and (self.show_cancelled or not t["cancelled"])
+                and (not self.tag_filter_id or any(tg["id"] == self.tag_filter_id for tg in t["tags"]))
+            ]
 
             for task in tasks:
                 subtasks = get_subtasks(self.conn, task["id"])
@@ -4780,6 +5516,7 @@ class KanbanBoard(QWidget):
                     tooltip_lines.append(f"Joplin: {task['joplin_link']}")
                 if tooltip_lines:
                     item.setToolTip("\n".join(tooltip_lines))
+                apply_card_state(item, task)
 
                 list_widget.addItem(item)
 
@@ -4810,7 +5547,7 @@ class KanbanBoard(QWidget):
             }
             template_subtask_titles = [s["title"] for s in get_template_subtasks(self.conn, template["id"])]
 
-        dialog = NewTaskDialog(self._columns_cache, default_status, self, prefill=prefill)
+        dialog = NewTaskDialog(self._columns_cache, default_status, self, prefill=prefill, conn=self.conn)
         if dialog.exec() != QDialog.Accepted:
             return
 
@@ -4819,6 +5556,8 @@ class KanbanBoard(QWidget):
             self.conn, self.current_board_id, values["title"], values["notes"], values["status"],
             values["due_date"], values["joplin_link"],
         )
+        if values["tag_ids"]:
+            set_task_tags(self.conn, task["id"], values["tag_ids"], "board")
         for subtask_title in template_subtask_titles:
             add_subtask(self.conn, task["id"], subtask_title)
         self.refresh()
@@ -4894,6 +5633,10 @@ class KanbanBoard(QWidget):
             move_task(self.conn, task_id, values["status"])
         if values["completed"] != bool(task["completed"]):
             set_task_completed(self.conn, task_id, values["completed"])
+        if (values["cancelled"] != bool(task["cancelled"])
+                or (values["cancelled"] and values["cancelled_note"] != (task["cancelled_note"] or ""))):
+            set_task_cancelled(self.conn, task_id, values["cancelled"], values["cancelled_note"])
+        set_task_tags(self.conn, task_id, values["tag_ids"], "board")
         self.refresh()
 
     def handle_move(self, task_id: str, new_status: str) -> None:
@@ -4912,6 +5655,31 @@ class KanbanBoard(QWidget):
 
     def show_move_task_menu(self, task_id: str, current_status: str, global_pos) -> None:
         menu = QMenu(self)
+
+        task = get_task(self.conn, task_id)
+        if task is not None and task["cancelled"]:
+            cancel_action = menu.addAction("Reopen (Un-cancel)")
+            cancel_action.triggered.connect(lambda: self.handle_set_cancelled(task_id, False))
+        else:
+            cancel_action = menu.addAction("Mark Cancelled")
+            cancel_action.triggered.connect(lambda: self.handle_set_cancelled(task_id, True))
+        delete_action = menu.addAction("Delete Task")
+        delete_action.triggered.connect(lambda: self.delete_task_ui(task_id))
+        menu.addSeparator()
+
+        other_boards = [b for b in get_boards(self.conn) if b["id"] != self.current_board_id]
+        board_menu = menu.addMenu("Move to Board")
+        if not other_boards:
+            empty = board_menu.addAction("No other boards")
+            empty.setEnabled(False)
+        else:
+            for board in other_boards:
+                action = board_menu.addAction(board["name"])
+                action.triggered.connect(
+                    lambda checked=False, bid=board["id"]: self.handle_move_to_board(task_id, bid)
+                )
+        menu.addSeparator()
+
         other_columns = [col for col in self._columns_cache if col["status"] != current_status]
         if not other_columns:
             no_columns_action = menu.addAction("No other columns")
@@ -4921,6 +5689,26 @@ class KanbanBoard(QWidget):
                 action = menu.addAction(f"Move to {col['name']}")
                 action.triggered.connect(lambda checked=False, s=col["status"]: self.handle_move(task_id, s))
         menu.exec(global_pos)
+
+    def handle_set_cancelled(self, task_id: str, cancelled: bool) -> None:
+        note = ""
+        if cancelled:
+            task = get_task(self.conn, task_id)
+            if task is None:
+                return
+            note = prompt_cancel_note(self, task["title"])
+            if note is None:
+                return
+        set_task_cancelled(self.conn, task_id, cancelled, note)
+        self.refresh()
+
+    def handle_move_to_board(self, task_id: str, board_id: str) -> None:
+        try:
+            move_task_to_board(self.conn, task_id, board_id)
+        except ValueError as e:
+            QMessageBox.warning(self, "Could not move task", str(e))
+            return
+        self.refresh()
 
     def delete_task_ui(self, task_id: str) -> None:
         task = get_task(self.conn, task_id)
@@ -5273,10 +6061,10 @@ class NewProjectTaskDialog(QDialog):
     NewTaskDialog, plus a second date (start_date, for the Gantt/Calendar
     views a later phase adds) and "link" instead of "joplin_link"."""
 
-    def __init__(self, columns: list, default_column_id, parent=None, default_start_date: QDate = None):
+    def __init__(self, columns: list, default_column_id, parent=None, default_start_date: QDate = None, conn=None):
         super().__init__(parent)
         self.setWindowTitle("New Task")
-        self.resize(420, 460)
+        self.resize(420, 540)
 
         layout = QVBoxLayout(self)
 
@@ -5300,6 +6088,12 @@ class NewProjectTaskDialog(QDialog):
         self.due_date_check, self.due_date_edit = self._build_date_row(
             layout, default_project_task_due_date(start_default)
         )
+
+        self.tag_picker = None
+        if conn is not None:
+            layout.addWidget(QLabel("Tags"))
+            self.tag_picker = TagPickerWidget(conn)
+            layout.addWidget(self.tag_picker)
 
         layout.addWidget(QLabel("Link"))
         self.link_edit = QLineEdit()
@@ -5374,6 +6168,7 @@ class NewProjectTaskDialog(QDialog):
             "start_date": self.start_date_edit.date().toString("yyyy-MM-dd") if self.start_date_check.isChecked() else "",
             "due_date": self.due_date_edit.date().toString("yyyy-MM-dd") if self.due_date_check.isChecked() else "",
             "link": self.link_edit.text().strip(),
+            "tag_ids": self.tag_picker.selected_ids() if self.tag_picker is not None else [],
         }
 
 
@@ -5569,7 +6364,7 @@ class ProjectTaskCardDialog(QDialog):
         self.conn = conn
         self.task_id = task["id"]
         self.setWindowTitle(task["title"])
-        self.resize(440, 700)
+        self.resize(440, 820)
         self.delete_requested = False
         self.subboard_action_requested = False
 
@@ -5596,6 +6391,14 @@ class ProjectTaskCardDialog(QDialog):
         self.completed_check = QCheckBox("Completed")
         self.completed_check.setChecked(bool(task.get("completed")))
         details_layout.addWidget(self.completed_check)
+
+        self.cancelled_check, self.cancelled_note_edit = build_cancel_row(details_layout, task)
+
+        details_layout.addWidget(QLabel("Tags"))
+        self.tag_picker = TagPickerWidget(
+            conn, [t["id"] for t in get_task_tags(conn, task["id"], "project")]
+        )
+        details_layout.addWidget(self.tag_picker)
 
         details_layout.addWidget(QLabel("Start Date"))
         default_start = default_project_task_start_date(conn, task["board_id"], exclude_task_id=task["id"])
@@ -5786,6 +6589,9 @@ class ProjectTaskCardDialog(QDialog):
             "due_date": self.due_date_edit.date().toString("yyyy-MM-dd") if self.due_date_check.isChecked() else "",
             "link": self.link_edit.text().strip(),
             "completed": self.completed_check.isChecked(),
+            "cancelled": self.cancelled_check.isChecked(),
+            "cancelled_note": self.cancelled_note_edit.text().strip(),
+            "tag_ids": self.tag_picker.selected_ids(),
         }
 
 
@@ -5808,6 +6614,8 @@ class ProjectKanbanWidget(QWidget):
         self._columns_cache = []
         self._edit_mode = False
         self.show_completed = False
+        self.show_cancelled = False
+        self.tag_filter_id = None
 
         self.columns_layout = QHBoxLayout(self)
         self.columns_layout.setSpacing(12)
@@ -5852,6 +6660,14 @@ class ProjectKanbanWidget(QWidget):
         self.show_completed = enabled
         self.refresh()
 
+    def set_show_cancelled(self, enabled: bool) -> None:
+        self.show_cancelled = enabled
+        self.refresh()
+
+    def set_tag_filter(self, tag_id) -> None:
+        self.tag_filter_id = tag_id
+        self.refresh()
+
     # -- lightweight refresh (task list contents only) -------------------
 
     def refresh(self) -> None:
@@ -5861,7 +6677,12 @@ class ProjectKanbanWidget(QWidget):
             list_widget.clear()
 
             all_tasks = get_project_tasks_for_column(self.conn, self.board_id, column_id)
-            tasks = all_tasks if self.show_completed else [t for t in all_tasks if not t["completed"]]
+            tasks = [
+                t for t in all_tasks
+                if (self.show_completed or not t["completed"])
+                and (self.show_cancelled or not t["cancelled"])
+                and (not self.tag_filter_id or any(tg["id"] == self.tag_filter_id for tg in t["tags"]))
+            ]
 
             for task in tasks:
                 item = QListWidgetItem(self._task_card_text(task))
@@ -5873,6 +6694,7 @@ class ProjectKanbanWidget(QWidget):
                     font.setStrikeOut(True)
                     item.setFont(font)
                     item.setForeground(QColor("#767676"))
+                apply_card_state(item, task)
                 list_widget.addItem(item)
 
             list_widget.blockSignals(False)
@@ -5894,15 +6716,18 @@ class ProjectKanbanWidget(QWidget):
         default_column_id = target_status or get_default_new_project_task_column(self.conn, self.board_id)
         default_start = default_project_task_start_date(self.conn, self.board_id)
         dialog = NewProjectTaskDialog(
-            self._columns_cache, default_column_id, self, default_start_date=default_start
+            self._columns_cache, default_column_id, self, default_start_date=default_start,
+            conn=self.conn,
         )
         if dialog.exec() != QDialog.Accepted:
             return
         values = dialog.result_values()
-        add_project_task(
+        task = add_project_task(
             self.conn, self.board_id, values["column_id"], values["title"], values["notes"],
             values["start_date"], values["due_date"], values["link"],
         )
+        if values["tag_ids"]:
+            set_task_tags(self.conn, task["id"], values["tag_ids"], "project")
         self.hub.refresh_all_views()
 
     def add_multiple_tasks_ui(self) -> None:
@@ -5943,6 +6768,10 @@ class ProjectKanbanWidget(QWidget):
             move_project_task(self.conn, task_id, values["column_id"])
         if values["completed"] != bool(task["completed"]):
             set_project_task_completed(self.conn, task_id, values["completed"])
+        if (values["cancelled"] != bool(task["cancelled"])
+                or (values["cancelled"] and values["cancelled_note"] != (task["cancelled_note"] or ""))):
+            set_project_task_cancelled(self.conn, task_id, values["cancelled"], values["cancelled_note"])
+        set_task_tags(self.conn, task_id, values["tag_ids"], "project")
 
         if dialog.subboard_action_requested:
             self.hub.open_or_create_subboard(task_id)
@@ -5956,6 +6785,18 @@ class ProjectKanbanWidget(QWidget):
             return
         move_project_task(self.conn, task_id, new_column_id)
         self.hub.refresh_all_views()
+
+    def handle_set_cancelled(self, task_id: str, cancelled: bool) -> None:
+        note = ""
+        if cancelled:
+            task = get_project_task(self.conn, task_id)
+            if task is None:
+                return
+            note = prompt_cancel_note(self, task["title"])
+            if note is None:
+                return
+        set_project_task_cancelled(self.conn, task_id, cancelled, note)
+        QTimer.singleShot(0, self.hub.refresh_all_views)
 
     def handle_set_completed(self, task_id: str, completed: bool) -> None:
         set_project_task_completed(self.conn, task_id, completed)
@@ -5975,6 +6816,13 @@ class ProjectKanbanWidget(QWidget):
         else:
             create_action = menu.addAction("Create Sub-board")
             create_action.triggered.connect(lambda: self.hub.open_or_create_subboard(task_id))
+        task = get_project_task(self.conn, task_id)
+        if task is not None and task["cancelled"]:
+            cancel_action = menu.addAction("Reopen (Un-cancel)")
+            cancel_action.triggered.connect(lambda: self.handle_set_cancelled(task_id, False))
+        else:
+            cancel_action = menu.addAction("Mark Cancelled")
+            cancel_action.triggered.connect(lambda: self.handle_set_cancelled(task_id, True))
         delete_action = menu.addAction("Delete Task")
         delete_action.triggered.connect(lambda: self.hub.confirm_and_delete_task(task_id))
         menu.addSeparator()
@@ -6538,17 +7386,43 @@ class ProjectCalendarView(QWidget):
                 f"{week_start.toString('MMM d')} - {week_start.addDays(6).toString('MMM d, yyyy')}"
             )
 
-        if not self.board_id:
+        tasks = self._load_items()
+        if tasks is None:
             return
 
         weeks = self._visible_weeks()
-        tasks = get_calendar_project_tasks(self.conn, self.board_id)
         task_ranges = {t["id"]: self._effective_range(t) for t in tasks}
         current_month = self.anchor.month() if self.mode == self.MODE_MONTH else None
 
         grid_row = 1
         for week in weeks:
             grid_row = self._build_week_row(week, tasks, task_ranges, grid_row, current_month)
+
+    # -- hooks (GlobalCalendarView overrides these to feed other data) ------
+
+    def _load_items(self):
+        """The dicts to place on the grid (each needs id, title and
+        whatever _effective_range reads), or None when there is nothing
+        to show yet."""
+        if not self.board_id:
+            return None
+        tasks = get_calendar_project_tasks(self.conn, self.board_id)
+        show_cancelled = self.hub.kanban_widget.show_cancelled
+        return [t for t in tasks if show_cancelled or not t["cancelled"]]
+
+    def _chip_label(self, task: dict) -> str:
+        return ("✕ " if task.get("cancelled") else "") + task["title"]
+
+    def _chip_tooltip(self, task: dict) -> str:
+        return "\n".join(build_project_task_meta_parts(self.conn, task))
+
+    def _chip_fill(self, task: dict) -> str:
+        if task.get("cancelled"):
+            return "#6b7280"
+        return project_column_color(self._column_position(task["column_id"]))
+
+    def _chip_clicked(self, task: dict) -> None:
+        self.hub.kanban_widget.edit_task(task["id"])
 
     def _clear_grid_rows(self) -> None:
         # The first 7 items (row 0's weekday headers) are added once in
@@ -6621,7 +7495,7 @@ class ProjectCalendarView(QWidget):
             col = week.index(seg_start)
             col_span = seg_start.daysTo(seg_end) + 1
 
-            label_text = t["title"]
+            label_text = self._chip_label(t)
             if eff_start < seg_start:
                 label_text = "◂ " + label_text
             if eff_end > seg_end:
@@ -6630,14 +7504,14 @@ class ProjectCalendarView(QWidget):
             chip = QPushButton(label_text)
             chip.setFixedHeight(self.CHIP_HEIGHT)
             chip.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            chip.setToolTip("\n".join(build_project_task_meta_parts(self.conn, t)))
-            fill = project_column_color(self._column_position(t["column_id"]))
+            chip.setToolTip(self._chip_tooltip(t))
+            fill = self._chip_fill(t)
             chip.setStyleSheet(
                 f"QPushButton {{ background-color: {fill}; color: white; border: none; "
                 f"border-radius: 4px; text-align: left; padding: 1px 6px; font-size: 11px; }}"
                 f"QPushButton:hover {{ background-color: {fill}; }}"
             )
-            chip.clicked.connect(lambda checked=False, tid=t["id"]: self.hub.kanban_widget.edit_task(tid))
+            chip.clicked.connect(lambda checked=False, task=t: self._chip_clicked(task))
             self.grid.addWidget(chip, grid_row + 1 + lane_idx, col, 1, col_span)
 
         overflow_row = grid_row + 1 + visible_lane_count
@@ -6669,6 +7543,158 @@ class ProjectCalendarView(QWidget):
         return column["position"] if column else 0
 
 
+class GlobalCalendarView(ProjectCalendarView):
+    """One calendar for everything dated across every standard board and
+    every project (see get_global_calendar_items). Reuses the project
+    Calendar's month/week grid, lane packing and chips wholesale - only
+    the data source, chip colors (one per board/project, with a legend)
+    and click-through differ. Standard tasks have just a due date, so
+    they are single-day chips; project tasks with a start date span.
+
+    open_item_callback(item) is injected by main() so this view needn't
+    know about the Boards/Projects pages; back_callback returns to the
+    boards page."""
+
+    def __init__(self, conn: sqlite3.Connection, open_item_callback, back_callback, parent=None):
+        super().__init__(conn, hub=None, parent=parent)
+        self._open_item_callback = open_item_callback
+        self._source_colors = {}
+
+        outer = self.layout()
+
+        top_row = QHBoxLayout()
+        back_btn = QPushButton("← Boards")
+        back_btn.clicked.connect(back_callback)
+        top_row.addWidget(back_btn)
+        title = QLabel("Calendar - all boards and projects")
+        title.setStyleSheet("font-weight: bold; font-size: 15px; padding-left: 8px;")
+        top_row.addWidget(title)
+        top_row.addStretch()
+
+        self.source_combo = QComboBox()
+        self.source_combo.setToolTip("Limit the calendar to one board or project")
+        top_row.addWidget(self.source_combo)
+        self.tag_combo = QComboBox()
+        self.tag_combo.setToolTip("Only show tasks with this tag")
+        top_row.addWidget(self.tag_combo)
+        self.show_completed_check = QCheckBox("Completed")
+        self.show_cancelled_check = QCheckBox("Cancelled")
+        top_row.addWidget(self.show_completed_check)
+        top_row.addWidget(self.show_cancelled_check)
+        outer.insertLayout(0, top_row)
+
+        self.legend_label = QLabel()
+        self.legend_label.setWordWrap(True)
+        self.legend_label.setTextFormat(Qt.RichText)
+        outer.insertWidget(2, self.legend_label)
+
+        self.source_combo.currentIndexChanged.connect(self._rebuild)
+        self.tag_combo.currentIndexChanged.connect(self._rebuild)
+        self.show_completed_check.toggled.connect(self._rebuild)
+        self.show_cancelled_check.toggled.connect(self._rebuild)
+        self._rebuild_filter_choices()
+
+    # -- filters -------------------------------------------------------------
+
+    def _rebuild_filter_choices(self) -> None:
+        """Repopulates the source/tag combos from the live data, keeping
+        the current selection when it still exists."""
+        all_items = get_global_calendar_items(self.conn, True, True)
+        sources = {}
+        for item in all_items:
+            sources[(item["kind"], item["source_id"])] = item["source_name"]
+        for board in get_boards(self.conn):
+            sources.setdefault(("board", board["id"]), board["name"])
+        for project in get_projects(self.conn):
+            sources.setdefault(("project", project["id"]), project["name"])
+
+        for combo, entries, all_label in (
+            (self.source_combo,
+             [(f"{'Board' if key[0] == 'board' else 'Project'}: {name}", key)
+              for key, name in sorted(sources.items(), key=lambda kv: (kv[0][0], kv[1].lower()))],
+             "All boards & projects"),
+            (self.tag_combo, [(t["name"], t["id"]) for t in get_tags(self.conn)], "All tags"),
+        ):
+            current = combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem(all_label, None)
+            for label, data in entries:
+                combo.addItem(label, data)
+            idx = combo.findData(current)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
+
+    def _color_for(self, item: dict) -> str:
+        key = (item["kind"], item["source_id"])
+        if key not in self._source_colors:
+            self._source_colors[key] = CALENDAR_CHIP_COLORS[len(self._source_colors) % len(CALENDAR_CHIP_COLORS)]
+        return self._source_colors[key]
+
+    # -- ProjectCalendarView hooks ---------------------------------------------
+
+    def load_all(self) -> None:
+        """Called when the page is shown."""
+        self.anchor = QDate.currentDate()
+        self._rebuild_filter_choices()
+        self._rebuild()
+
+    def refresh(self) -> None:
+        self._rebuild_filter_choices()
+        self._rebuild()
+
+    def _load_items(self):
+        items = get_global_calendar_items(
+            self.conn,
+            include_completed=self.show_completed_check.isChecked(),
+            include_cancelled=self.show_cancelled_check.isChecked(),
+        )
+        source = self.source_combo.currentData()
+        if source is not None:
+            items = [i for i in items if (i["kind"], i["source_id"]) == source]
+        tag_id = self.tag_combo.currentData()
+        if tag_id is not None:
+            items = [i for i in items if any(t["id"] == tag_id for t in i["tags"])]
+
+        legend = {}
+        for item in items:
+            legend[self._color_for(item)] = item["source_name"]
+        self.legend_label.setText(
+            "   ".join(
+                f'<span style="color:{color}">●</span> {name}' for color, name in legend.items()
+            )
+        )
+        return items
+
+    def _effective_range(self, item: dict) -> tuple:
+        return QDate.fromString(item["start"], "yyyy-MM-dd"), QDate.fromString(item["end"], "yyyy-MM-dd")
+
+    def _chip_label(self, item: dict) -> str:
+        prefix = "✕ " if item["cancelled"] else ("✓ " if item["completed"] else "")
+        return prefix + item["title"]
+
+    def _chip_tooltip(self, item: dict) -> str:
+        lines = [item["title"], f"{'Project' if item['kind'] == 'project' else 'Board'}: {item['source_name']}"]
+        if item["start"] != item["end"]:
+            lines.append(f"{item['start']} → {item['end']}")
+        else:
+            lines.append(f"Due {item['end']}")
+        if item["tags"]:
+            lines.append("Tags: " + ", ".join(t["name"] for t in item["tags"]))
+        if item["cancelled"]:
+            lines.append("Cancelled")
+        return "\n".join(lines)
+
+    def _chip_fill(self, item: dict) -> str:
+        if item["cancelled"] or item["completed"]:
+            return "#6b7280"
+        return self._color_for(item)
+
+    def _chip_clicked(self, item: dict) -> None:
+        self._open_item_callback(item)
+        self.refresh()
+
+
 class ProjectActivityLogView(QWidget):
     """Project-wide Activity Log screen (issue §9.3/§9.4) - separate from
     the per-board view switcher since a project's history spans every
@@ -6695,7 +7721,7 @@ class ProjectActivityLogView(QWidget):
 
         self.action_combo = QComboBox()
         self.action_combo.addItem("All Actions", self.ACTION_FILTER_ALL)
-        for action_type, label in ACTIVITY_ACTION_TYPES:
+        for action_type, label in PROJECT_ACTIVITY_ACTION_TYPES:
             self.action_combo.addItem(label, action_type)
         self.action_combo.currentIndexChanged.connect(self.refresh)
         filter_row.addWidget(self.action_combo)
@@ -7080,6 +8106,21 @@ class ProjectsHub(QWidget):
         self.show_completed_btn.toggled.connect(self._on_show_completed_toggled)
         toolbar.addWidget(self.show_completed_btn)
 
+        self.show_cancelled_btn = QPushButton("Show Cancelled")
+        self.show_cancelled_btn.setCheckable(True)
+        self.show_cancelled_btn.toggled.connect(self._on_show_cancelled_toggled)
+        toolbar.addWidget(self.show_cancelled_btn)
+
+        self.tag_filter_combo = QComboBox()
+        self.tag_filter_combo.setToolTip("Only show tasks with this tag")
+        self.tag_filter_combo.currentIndexChanged.connect(self._on_tag_filter_changed)
+        toolbar.addWidget(self.tag_filter_combo)
+
+        self.manage_tags_btn = QPushButton("Tags")
+        self.manage_tags_btn.setToolTip("Create, rename, recolor or delete tags")
+        self.manage_tags_btn.clicked.connect(self._manage_tags)
+        toolbar.addWidget(self.manage_tags_btn)
+
         self.edit_board_btn = QPushButton("Edit Board")
         self.edit_board_btn.setCheckable(True)
         self.edit_board_btn.setToolTip("Show or hide column move/rename/delete controls")
@@ -7131,6 +8172,7 @@ class ProjectsHub(QWidget):
         board_page_layout.addWidget(self.content_stack, stretch=1)
 
         self.kanban_widget = ProjectKanbanWidget(conn, self)
+        self._rebuild_tag_filter()
         self.list_view = ProjectListView(conn, self)
         self.missing_dates_view = ProjectMissingDatesView(conn, self)
         self.gantt_view = ProjectGanttView(conn, self)
@@ -7223,6 +8265,7 @@ class ProjectsHub(QWidget):
         self.set_view(last_view, persist=False)
 
     def refresh_all_views(self) -> None:
+        self._rebuild_tag_filter()  # a dialog may have just created a tag
         self.kanban_widget.refresh()
         self.list_view.refresh()
         self.missing_dates_view.refresh()
@@ -7271,6 +8314,29 @@ class ProjectsHub(QWidget):
         self.edit_board_btn.setText("Done Editing" if checked else "Edit Board")
         self.add_col_btn.setVisible(checked)
         self.kanban_widget.set_edit_mode(checked)
+
+    def _on_show_cancelled_toggled(self, checked: bool) -> None:
+        self.kanban_widget.set_show_cancelled(checked)
+
+    def _rebuild_tag_filter(self) -> None:
+        current = self.tag_filter_combo.currentData()
+        self.tag_filter_combo.blockSignals(True)
+        self.tag_filter_combo.clear()
+        self.tag_filter_combo.addItem("All tags", None)
+        for tag in get_tags(self.conn):
+            self.tag_filter_combo.addItem(tag["name"], tag["id"])
+        idx = self.tag_filter_combo.findData(current)
+        self.tag_filter_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.tag_filter_combo.blockSignals(False)
+        self.kanban_widget.tag_filter_id = self.tag_filter_combo.currentData()
+
+    def _on_tag_filter_changed(self, _index: int) -> None:
+        self.kanban_widget.set_tag_filter(self.tag_filter_combo.currentData())
+
+    def _manage_tags(self) -> None:
+        ManageTagsDialog(self.conn, self).exec()
+        self._rebuild_tag_filter()
+        self.refresh_all_views()
 
     def _on_show_completed_toggled(self, checked: bool) -> None:
         self.kanban_widget.set_show_completed(checked)
@@ -7625,12 +8691,32 @@ def main():
     window.setCentralWidget(central_stack)
 
     board = KanbanBoard(conn)
-    projects_hub = ProjectsHub(conn, on_back_to_boards=lambda: central_stack.setCurrentWidget(board))
+    projects_hub = ProjectsHub(conn, on_back_to_boards=lambda: (board.refresh(), central_stack.setCurrentWidget(board)))
     board.set_open_project_callback(
         lambda project_id: (projects_hub.load_project(project_id), central_stack.setCurrentWidget(projects_hub))
     )
+
+    def open_calendar_item(item: dict) -> None:
+        # Opens the task's own edit dialog in place, over the calendar.
+        if item["kind"] == "board":
+            board._select_board(item["board_id"])
+            board.edit_task(item["id"])
+        else:
+            projects_hub.navigate_to_board(item["board_id"])
+            projects_hub.kanban_widget.edit_task(item["id"])
+
+    global_calendar = GlobalCalendarView(
+        conn, open_calendar_item, back_callback=lambda: central_stack.setCurrentWidget(board)
+    )
+
+    def show_global_calendar() -> None:
+        global_calendar.load_all()
+        central_stack.setCurrentWidget(global_calendar)
+
+    board.set_open_calendar_callback(show_global_calendar)
     central_stack.addWidget(board)
     central_stack.addWidget(projects_hub)
+    central_stack.addWidget(global_calendar)
     central_stack.setCurrentWidget(board)
 
     window.resize(1150, 640)
