@@ -31,6 +31,8 @@ import secrets
 import sqlite3
 import platform
 import threading
+import urllib.request
+import urllib.error
 from datetime import datetime, date, timedelta, time as dt_time
 
 from PySide6.QtCore import Qt, QRect, QPoint, QDate, QTime, QDateTime, QTimer, QObject, Signal, QPropertyAnimation, QEasingCurve, QUrl
@@ -413,6 +415,19 @@ def init_db(conn: sqlite3.Connection) -> None:
             name TEXT NOT NULL UNIQUE COLLATE NOCASE,
             color TEXT NOT NULL,
             position INTEGER NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS calendar_subscriptions (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            url TEXT NOT NULL,
+            color TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            position INTEGER NOT NULL,
+            ics_text TEXT NOT NULL DEFAULT '',
+            last_fetched TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT ''
         )
     """)
     conn.execute("""
@@ -2807,6 +2822,221 @@ def get_board_activity_log_entries(
 
     query += " ORDER BY created_at DESC"
     return [dict(r) for r in conn.execute(query, params).fetchall()]
+
+
+# -- External calendar subscriptions (read-only ICS feeds) -----------------
+#
+# A subscription is just a URL. Its feed text is downloaded (off the UI
+# thread - see the GUI's CalendarFetcher) and stored verbatim in
+# ics_text; events are expanded from that stored text on demand for
+# whatever date range the Calendar is showing, so recurring events never
+# need to be materialised ahead of time. Nothing here ever writes back to
+# the remote calendar.
+
+ICS_MAX_BYTES = 10 * 1024 * 1024
+ICS_STALE_AFTER = timedelta(hours=1)
+
+
+def normalize_calendar_url(url: str) -> str:
+    """webcal(s):// is just https/http under another name."""
+    url = url.strip()
+    lowered = url.lower()
+    if lowered.startswith("webcals://"):
+        return "https://" + url[len("webcals://"):]
+    if lowered.startswith("webcal://"):
+        return "https://" + url[len("webcal://"):]
+    return url
+
+
+def get_calendar_subscriptions(conn: sqlite3.Connection) -> list:
+    rows = conn.execute(
+        "SELECT * FROM calendar_subscriptions ORDER BY position ASC, name ASC"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_calendar_subscription(conn: sqlite3.Connection, sub_id: str):
+    row = conn.execute("SELECT * FROM calendar_subscriptions WHERE id = ?", (sub_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def add_calendar_subscription(
+    conn: sqlite3.Connection, name: str, url: str, color: str = None,
+) -> dict:
+    name, url = name.strip(), normalize_calendar_url(url)
+    if not name:
+        raise ValueError("Calendar name cannot be empty.")
+    if not url.lower().startswith(("http://", "https://")):
+        raise ValueError("The calendar address must be an http(s):// or webcal:// URL.")
+    max_row = conn.execute("SELECT MAX(position) AS m FROM calendar_subscriptions").fetchone()
+    position = (max_row["m"] + 1) if max_row["m"] is not None else 0
+    if color is None:
+        color = TAG_COLORS[(position + 3) % len(TAG_COLORS)]
+    sub_id = uuid.uuid4().hex
+    conn.execute(
+        "INSERT INTO calendar_subscriptions (id, name, url, color, position) VALUES (?, ?, ?, ?, ?)",
+        (sub_id, name, url, color, position),
+    )
+    conn.commit()
+    return get_calendar_subscription(conn, sub_id)
+
+
+def update_calendar_subscription(
+    conn: sqlite3.Connection, sub_id: str, name: str, url: str, color: str, enabled: bool,
+) -> None:
+    name, url = name.strip(), normalize_calendar_url(url)
+    if not name:
+        raise ValueError("Calendar name cannot be empty.")
+    if not url.lower().startswith(("http://", "https://")):
+        raise ValueError("The calendar address must be an http(s):// or webcal:// URL.")
+    old = get_calendar_subscription(conn, sub_id)
+    if old is None:
+        return
+    # A different URL makes the cached feed text meaningless.
+    reset_cache = old["url"] != url
+    conn.execute(
+        "UPDATE calendar_subscriptions SET name = ?, url = ?, color = ?, enabled = ?"
+        + (", ics_text = '', last_fetched = '', last_error = ''" if reset_cache else "")
+        + " WHERE id = ?",
+        (name, url, color, 1 if enabled else 0, sub_id),
+    )
+    conn.commit()
+
+
+def delete_calendar_subscription(conn: sqlite3.Connection, sub_id: str) -> None:
+    conn.execute("DELETE FROM calendar_subscriptions WHERE id = ?", (sub_id,))
+    conn.commit()
+
+
+def set_calendar_fetch_result(
+    conn: sqlite3.Connection, sub_id: str, ics_text: str = None, error: str = "",
+) -> None:
+    """On success stores the feed; on failure keeps the last good feed (so
+    an offline launch still shows yesterday's events) and records why."""
+    if ics_text is not None:
+        conn.execute(
+            "UPDATE calendar_subscriptions SET ics_text = ?, last_fetched = ?, last_error = '' WHERE id = ?",
+            (ics_text, _now(), sub_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE calendar_subscriptions SET last_error = ? WHERE id = ?", (error, sub_id)
+        )
+    conn.commit()
+
+
+def calendar_subscription_is_stale(sub: dict) -> bool:
+    if not sub["last_fetched"]:
+        return True
+    try:
+        return datetime.now() - datetime.fromisoformat(sub["last_fetched"]) > ICS_STALE_AFTER
+    except ValueError:
+        return True
+
+
+def fetch_ics_text(url: str, timeout: float = 20.0) -> str:
+    """Downloads a feed. Raises ValueError with a user-presentable message
+    on any failure. Blocking - call from a worker thread."""
+    request = urllib.request.Request(
+        normalize_calendar_url(url), headers={"User-Agent": "Kanvas calendar subscription"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = response.read(ICS_MAX_BYTES + 1)
+    except urllib.error.HTTPError as e:
+        raise ValueError(f"The server answered HTTP {e.code}.") from e
+    except (urllib.error.URLError, OSError) as e:
+        raise ValueError(f"Could not reach the calendar: {getattr(e, 'reason', e)}") from e
+    if len(data) > ICS_MAX_BYTES:
+        raise ValueError("The calendar feed is larger than 10 MB.")
+    text = data.decode("utf-8", errors="replace")
+    if "BEGIN:VCALENDAR" not in text:
+        raise ValueError("That address did not return an iCalendar (.ics) feed.")
+    return text
+
+
+_PARSED_ICS_CACHE = {}   # (sub_id, last_fetched) -> parsed icalendar.Calendar
+
+
+def _parsed_calendar(sub: dict):
+    key = (sub["id"], sub["last_fetched"])
+    if key not in _PARSED_ICS_CACHE:
+        import icalendar
+        for stale in [k for k in _PARSED_ICS_CACHE if k[0] == sub["id"]]:
+            del _PARSED_ICS_CACHE[stale]
+        _PARSED_ICS_CACHE[key] = icalendar.Calendar.from_ical(sub["ics_text"])
+    return _PARSED_ICS_CACHE[key]
+
+
+def get_external_calendar_items(conn: sqlite3.Connection, range_start: date, range_end: date) -> list:
+    """Events from every enabled subscription that touch [range_start,
+    range_end] (inclusive), in the same dict shape as
+    get_global_calendar_items() plus kind "external", "time" (display
+    text, "" for all-day), "location" and "description". Feeds that fail
+    to parse are skipped (and flagged in last_error) rather than breaking
+    the whole calendar. Requires icalendar + recurring-ical-events;
+    raises ImportError if they are missing."""
+    import recurring_ical_events
+
+    items = []
+    for sub in get_calendar_subscriptions(conn):
+        if not sub["enabled"] or not sub["ics_text"]:
+            continue
+        try:
+            cal = _parsed_calendar(sub)
+            events = recurring_ical_events.of(cal).between(
+                range_start, range_end + timedelta(days=1)
+            )
+        except Exception as e:  # malformed feeds come in endless flavours
+            set_calendar_fetch_result(conn, sub["id"], error=f"Could not read the feed: {e}")
+            continue
+
+        for ev in events:
+            start_prop = ev.get("DTSTART")
+            if start_prop is None:
+                continue
+            start_val = start_prop.dt
+            end_prop = ev.get("DTEND")
+            end_val = end_prop.dt if end_prop is not None else None
+
+            if isinstance(start_val, datetime):
+                start_local = start_val.astimezone() if start_val.tzinfo else start_val
+                end_local = (
+                    (end_val.astimezone() if end_val.tzinfo else end_val)
+                    if isinstance(end_val, datetime) else start_local
+                )
+                start_day, end_day = start_local.date(), end_local.date()
+                # An event ending exactly at midnight belongs to the day before.
+                if end_local > start_local and end_local.time() == dt_time(0, 0) and end_day > start_day:
+                    end_day -= timedelta(days=1)
+                time_text = start_local.strftime("%H:%M")
+                if end_local != start_local and end_day == start_day:
+                    time_text += "–" + end_local.strftime("%H:%M")
+            else:
+                start_day = start_val
+                # All-day DTEND is exclusive.
+                end_day = (end_val - timedelta(days=1)) if isinstance(end_val, date) and end_val > start_val else start_val
+                time_text = ""
+
+            if end_day < range_start or start_day > range_end:
+                continue
+            uid = str(ev.get("UID", ""))
+            items.append({
+                "kind": "external",
+                "id": f"{sub['id']}:{uid}:{start_day.isoformat()}",
+                "title": str(ev.get("SUMMARY", "(no title)")),
+                "start": start_day.isoformat(), "end": end_day.isoformat(),
+                "board_id": None,
+                "source_id": sub["id"], "source_name": sub["name"], "source_color": sub["color"],
+                "completed": False,
+                "cancelled": str(ev.get("STATUS", "")).upper() == "CANCELLED",
+                "tags": [],
+                "time": time_text,
+                "location": str(ev.get("LOCATION", "") or ""),
+                "description": str(ev.get("DESCRIPTION", "") or ""),
+            })
+    items.sort(key=lambda i: (i["start"], i["time"], i["title"].lower()))
+    return items
 
 
 # ---------------------------------------------------------------------------
@@ -7543,6 +7773,207 @@ class ProjectCalendarView(QWidget):
         return column["position"] if column else 0
 
 
+class CalendarFetcher(QObject):
+    """Downloads ICS feeds on worker threads. The sqlite connection is
+    bound to the UI thread, so workers only ever do the network read; the
+    result comes back as a signal (queued onto the UI thread) and the
+    slot - not the worker - writes it to the database."""
+
+    fetched = Signal(str, object, str)   # sub_id, ics_text or None, error message
+
+    def fetch(self, sub_id: str, url: str) -> None:
+        def work():
+            try:
+                self.fetched.emit(sub_id, fetch_ics_text(url), "")
+            except ValueError as e:
+                self.fetched.emit(sub_id, None, str(e))
+            except Exception as e:  # never let a worker die silently
+                self.fetched.emit(sub_id, None, f"Unexpected error: {e}")
+        threading.Thread(target=work, daemon=True).start()
+
+
+class ManageCalendarsDialog(QDialog):
+    """Add / edit / enable / remove external calendar subscriptions."""
+
+    def __init__(self, conn: sqlite3.Connection, fetcher: CalendarFetcher, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.fetcher = fetcher
+        self.setWindowTitle("External Calendars")
+        self.resize(520, 420)
+        self.changed = False
+
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            "Subscribe to read-only iCalendar (.ics) feeds - e.g. the secret iCal address from "
+            "Google Calendar, Outlook or Nextcloud, or a public holidays feed. webcal:// links work too."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.list_widget = QListWidget()
+        self.list_widget.itemChanged.connect(self._on_item_changed)
+        self.list_widget.itemDoubleClicked.connect(lambda _item: self._edit())
+        layout.addWidget(self.list_widget, stretch=1)
+
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color: #9a9a9a; font-size: 11px;")
+        layout.addWidget(self.status_label)
+        self.list_widget.currentItemChanged.connect(lambda *_: self._update_status())
+
+        row = QHBoxLayout()
+        for text, handler in (
+            ("Add…", self._add), ("Edit…", self._edit), ("Color…", self._recolor),
+            ("Refresh", self._refresh_selected), ("Remove", self._remove),
+        ):
+            btn = QPushButton(text)
+            btn.clicked.connect(handler)
+            row.addWidget(btn)
+        layout.addLayout(row)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn)
+        self._reload()
+
+    def _reload(self, select_id: str = None) -> None:
+        self.list_widget.blockSignals(True)
+        self.list_widget.clear()
+        for sub in get_calendar_subscriptions(self.conn):
+            item = QListWidgetItem(sub["name"])
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if sub["enabled"] else Qt.Unchecked)
+            item.setForeground(QColor(sub["color"]))
+            item.setData(Qt.UserRole, sub["id"])
+            item.setToolTip(sub["url"])
+            self.list_widget.addItem(item)
+            if sub["id"] == select_id:
+                self.list_widget.setCurrentItem(item)
+        self.list_widget.blockSignals(False)
+        self._update_status()
+
+    def _current(self):
+        item = self.list_widget.currentItem()
+        return get_calendar_subscription(self.conn, item.data(Qt.UserRole)) if item else None
+
+    def _update_status(self) -> None:
+        sub = self._current()
+        if sub is None:
+            self.status_label.setText("")
+            return
+        parts = [sub["url"]]
+        parts.append(f"Last updated {sub['last_fetched']}" if sub["last_fetched"] else "Not fetched yet")
+        if sub["last_error"]:
+            parts.append(f"⚠ {sub['last_error']}")
+        self.status_label.setText("\n".join(parts))
+
+    def _on_item_changed(self, item: QListWidgetItem) -> None:
+        sub = get_calendar_subscription(self.conn, item.data(Qt.UserRole))
+        if sub is None:
+            return
+        update_calendar_subscription(
+            self.conn, sub["id"], sub["name"], sub["url"], sub["color"], item.checkState() == Qt.Checked
+        )
+        self.changed = True
+
+    def _prompt(self, title: str, name: str = "", url: str = ""):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(440, 150)
+        form = QVBoxLayout(dialog)
+        form.addWidget(QLabel("Name"))
+        name_edit = QLineEdit(name)
+        form.addWidget(name_edit)
+        form.addWidget(QLabel("Calendar address (.ics / webcal:// URL)"))
+        url_edit = QLineEdit(url)
+        url_edit.setPlaceholderText("https://example.com/calendar.ics")
+        form.addWidget(url_edit)
+        btns = QHBoxLayout()
+        btns.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(dialog.reject)
+        ok = QPushButton("Save")
+        ok.setProperty("accent", True)
+        ok.setDefault(True)
+        ok.clicked.connect(dialog.accept)
+        btns.addWidget(cancel)
+        btns.addWidget(ok)
+        form.addLayout(btns)
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        return name_edit.text(), url_edit.text()
+
+    def _add(self) -> None:
+        values = self._prompt("Add Calendar")
+        if values is None:
+            return
+        try:
+            sub = add_calendar_subscription(self.conn, *values)
+        except ValueError as e:
+            QMessageBox.warning(self, "Could not add calendar", str(e))
+            return
+        self.changed = True
+        self.fetcher.fetch(sub["id"], sub["url"])
+        self._reload(sub["id"])
+
+    def _edit(self) -> None:
+        sub = self._current()
+        if sub is None:
+            return
+        values = self._prompt("Edit Calendar", sub["name"], sub["url"])
+        if values is None:
+            return
+        try:
+            update_calendar_subscription(
+                self.conn, sub["id"], values[0], values[1], sub["color"], bool(sub["enabled"])
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "Could not save calendar", str(e))
+            return
+        self.changed = True
+        updated = get_calendar_subscription(self.conn, sub["id"])
+        if updated["url"] != sub["url"]:
+            self.fetcher.fetch(sub["id"], updated["url"])
+        self._reload(sub["id"])
+
+    def _recolor(self) -> None:
+        sub = self._current()
+        if sub is None:
+            return
+        color = QColorDialog.getColor(QColor(sub["color"]), self, "Calendar color")
+        if not color.isValid():
+            return
+        update_calendar_subscription(
+            self.conn, sub["id"], sub["name"], sub["url"], color.name(), bool(sub["enabled"])
+        )
+        self.changed = True
+        self._reload(sub["id"])
+
+    def _refresh_selected(self) -> None:
+        sub = self._current()
+        if sub is not None:
+            self.fetcher.fetch(sub["id"], sub["url"])
+            self.status_label.setText("Refreshing…")
+
+    def refresh_status(self) -> None:
+        """Called by the owner after a fetch result lands in the database."""
+        self._update_status()
+
+    def _remove(self) -> None:
+        sub = self._current()
+        if sub is None:
+            return
+        reply = QMessageBox.question(
+            self, "Remove calendar", f'Stop subscribing to "{sub["name"]}"?',
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            delete_calendar_subscription(self.conn, sub["id"])
+            self.changed = True
+            self._reload()
+
+
 class GlobalCalendarView(ProjectCalendarView):
     """One calendar for everything dated across every standard board and
     every project (see get_global_calendar_items). Reuses the project
@@ -7581,7 +8012,21 @@ class GlobalCalendarView(ProjectCalendarView):
         self.show_cancelled_check = QCheckBox("Cancelled")
         top_row.addWidget(self.show_completed_check)
         top_row.addWidget(self.show_cancelled_check)
+        self.calendars_btn = QPushButton("Calendars…")
+        self.calendars_btn.setToolTip("Subscribe to external calendars (iCalendar / webcal feeds)")
+        self.calendars_btn.clicked.connect(self._manage_calendars)
+        top_row.addWidget(self.calendars_btn)
+        self.refresh_btn = QPushButton("⟳")
+        self.refresh_btn.setFixedWidth(32)
+        self.refresh_btn.setToolTip("Re-download all external calendars now")
+        self.refresh_btn.clicked.connect(lambda: self._fetch_subscriptions(force=True))
+        top_row.addWidget(self.refresh_btn)
         outer.insertLayout(0, top_row)
+
+        self._external_error = ""
+        self._manage_dialog = None
+        self.fetcher = CalendarFetcher(self)
+        self.fetcher.fetched.connect(self._on_fetched)
 
         self.legend_label = QLabel()
         self.legend_label.setWordWrap(True)
@@ -7596,6 +8041,29 @@ class GlobalCalendarView(ProjectCalendarView):
 
     # -- filters -------------------------------------------------------------
 
+    # -- external calendar subscriptions ---------------------------------------
+
+    def _fetch_subscriptions(self, force: bool = False) -> None:
+        for sub in get_calendar_subscriptions(self.conn):
+            if sub["enabled"] and (force or calendar_subscription_is_stale(sub)):
+                self.fetcher.fetch(sub["id"], sub["url"])
+
+    def _on_fetched(self, sub_id: str, ics_text, error: str) -> None:
+        if get_calendar_subscription(self.conn, sub_id) is None:
+            return   # removed while the download was in flight
+        set_calendar_fetch_result(self.conn, sub_id, ics_text, error)
+        if self._manage_dialog is not None:
+            self._manage_dialog.refresh_status()
+        self.refresh()
+
+    def _manage_calendars(self) -> None:
+        dialog = ManageCalendarsDialog(self.conn, self.fetcher, self)
+        self._manage_dialog = dialog
+        dialog.exec()
+        self._manage_dialog = None
+        if dialog.changed:
+            self.refresh()
+
     def _rebuild_filter_choices(self) -> None:
         """Repopulates the source/tag combos from the live data, keeping
         the current selection when it still exists."""
@@ -7607,10 +8075,12 @@ class GlobalCalendarView(ProjectCalendarView):
             sources.setdefault(("board", board["id"]), board["name"])
         for project in get_projects(self.conn):
             sources.setdefault(("project", project["id"]), project["name"])
+        for sub in get_calendar_subscriptions(self.conn):
+            sources[("external", sub["id"])] = sub["name"]
 
         for combo, entries, all_label in (
             (self.source_combo,
-             [(f"{'Board' if key[0] == 'board' else 'Project'}: {name}", key)
+             [(f"{ {'board': 'Board', 'project': 'Project', 'external': 'Calendar'}[key[0]] }: {name}", key)
               for key, name in sorted(sources.items(), key=lambda kv: (kv[0][0], kv[1].lower()))],
              "All boards & projects"),
             (self.tag_combo, [(t["name"], t["id"]) for t in get_tags(self.conn)], "All tags"),
@@ -7626,6 +8096,8 @@ class GlobalCalendarView(ProjectCalendarView):
             combo.blockSignals(False)
 
     def _color_for(self, item: dict) -> str:
+        if item["kind"] == "external":
+            return item["source_color"]
         key = (item["kind"], item["source_id"])
         if key not in self._source_colors:
             self._source_colors[key] = CALENDAR_CHIP_COLORS[len(self._source_colors) % len(CALENDAR_CHIP_COLORS)]
@@ -7638,6 +8110,7 @@ class GlobalCalendarView(ProjectCalendarView):
         self.anchor = QDate.currentDate()
         self._rebuild_filter_choices()
         self._rebuild()
+        self._fetch_subscriptions()
 
     def refresh(self) -> None:
         self._rebuild_filter_choices()
@@ -7649,6 +8122,21 @@ class GlobalCalendarView(ProjectCalendarView):
             include_completed=self.show_completed_check.isChecked(),
             include_cancelled=self.show_cancelled_check.isChecked(),
         )
+        self._external_error = ""
+        weeks = self._visible_weeks()
+        try:
+            external = get_external_calendar_items(
+                self.conn, weeks[0][0].toPython(), weeks[-1][6].toPython()
+            )
+            if not self.show_cancelled_check.isChecked():
+                external = [e for e in external if not e["cancelled"]]
+            items = items + external
+            items.sort(key=lambda i: (i["start"], i["end"], i.get("time", ""), i["title"].lower()))
+        except ImportError:
+            if any(sub["enabled"] for sub in get_calendar_subscriptions(self.conn)):
+                self._external_error = (
+                    "External calendars need two extra packages: pip install icalendar recurring-ical-events"
+                )
         source = self.source_combo.currentData()
         if source is not None:
             items = [i for i in items if (i["kind"], i["source_id"]) == source]
@@ -7659,11 +8147,20 @@ class GlobalCalendarView(ProjectCalendarView):
         legend = {}
         for item in items:
             legend[self._color_for(item)] = item["source_name"]
-        self.legend_label.setText(
-            "   ".join(
-                f'<span style="color:{color}">●</span> {name}' for color, name in legend.items()
-            )
+        legend_html = "   ".join(
+            f'<span style="color:{color}">●</span> {name}' for color, name in legend.items()
         )
+        errors = [
+            f'{sub["name"]}: {sub["last_error"]}'
+            for sub in get_calendar_subscriptions(self.conn) if sub["enabled"] and sub["last_error"]
+        ]
+        if self._external_error:
+            errors.append(self._external_error)
+        if errors:
+            legend_html += (
+                '<br><span style="color:#d97706">⚠ ' + " · ".join(errors).replace("<", "&lt;") + "</span>"
+            )
+        self.legend_label.setText(legend_html)
         return items
 
     def _effective_range(self, item: dict) -> tuple:
@@ -7671,10 +8168,18 @@ class GlobalCalendarView(ProjectCalendarView):
 
     def _chip_label(self, item: dict) -> str:
         prefix = "✕ " if item["cancelled"] else ("✓ " if item["completed"] else "")
+        if item["kind"] == "external" and item["time"]:
+            prefix += item["time"].split("–")[0] + " "
         return prefix + item["title"]
 
     def _chip_tooltip(self, item: dict) -> str:
-        lines = [item["title"], f"{'Project' if item['kind'] == 'project' else 'Board'}: {item['source_name']}"]
+        kind_label = {"project": "Project", "board": "Board", "external": "Calendar"}[item["kind"]]
+        lines = [item["title"], f"{kind_label}: {item['source_name']}"]
+        if item["kind"] == "external":
+            if item["time"]:
+                lines.append(item["time"])
+            if item["location"]:
+                lines.append(f"Location: {item['location']}")
         if item["start"] != item["end"]:
             lines.append(f"{item['start']} → {item['end']}")
         else:
@@ -7691,6 +8196,18 @@ class GlobalCalendarView(ProjectCalendarView):
         return self._color_for(item)
 
     def _chip_clicked(self, item: dict) -> None:
+        if item["kind"] == "external":
+            # Read-only: show the event's details instead of an editor.
+            lines = [f"{item['start']}" + (f" → {item['end']}" if item["end"] != item["start"] else "")]
+            if item["time"]:
+                lines[0] += f"  {item['time']}"
+            if item["location"]:
+                lines.append(f"Location: {item['location']}")
+            if item["description"]:
+                lines.extend(["", item["description"]])
+            lines.extend(["", f"From calendar: {item['source_name']} (read-only)"])
+            QMessageBox.information(self, item["title"], "\n".join(lines))
+            return
         self._open_item_callback(item)
         self.refresh()
 

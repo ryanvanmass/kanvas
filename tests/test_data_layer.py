@@ -120,3 +120,96 @@ def test_global_calendar(conn):
     assert [i["title"] for i in items] == ["span", "dated"]
     assert items[0]["kind"] == "project" and items[0]["start"] == "2026-03-01"
     assert len(k.get_global_calendar_items(conn, include_cancelled=True)) == 3
+
+
+ICS = """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//test//EN
+BEGIN:VEVENT
+UID:weekly@test
+DTSTAMP:20260101T000000Z
+DTSTART:20260105T090000
+DTEND:20260105T100000
+RRULE:FREQ=WEEKLY;COUNT=3
+SUMMARY:Standup
+END:VEVENT
+BEGIN:VEVENT
+UID:trip@test
+DTSTAMP:20260101T000000Z
+DTSTART;VALUE=DATE:20260110
+DTEND;VALUE=DATE:20260113
+SUMMARY:Trip
+LOCATION:Paris
+END:VEVENT
+BEGIN:VEVENT
+UID:off@test
+DTSTAMP:20260101T000000Z
+DTSTART;VALUE=DATE:20260120
+STATUS:CANCELLED
+SUMMARY:Called off
+END:VEVENT
+END:VCALENDAR
+"""
+
+
+def test_subscription_crud_and_url_normalising(conn):
+    sub = k.add_calendar_subscription(conn, " Work ", "webcal://example.com/a.ics")
+    assert sub["url"] == "https://example.com/a.ics" and sub["name"] == "Work"
+    with pytest.raises(ValueError):
+        k.add_calendar_subscription(conn, "x", "ftp://nope")
+    with pytest.raises(ValueError):
+        k.add_calendar_subscription(conn, "", "https://example.com/a.ics")
+    k.set_calendar_fetch_result(conn, sub["id"], ICS)
+    k.set_calendar_fetch_result(conn, sub["id"], error="offline")
+    got = k.get_calendar_subscription(conn, sub["id"])
+    assert got["ics_text"] == ICS and got["last_error"] == "offline"  # last good feed kept
+    k.update_calendar_subscription(conn, sub["id"], "Work", "https://example.com/b.ics", sub["color"], True)
+    assert k.get_calendar_subscription(conn, sub["id"])["ics_text"] == ""  # new URL drops cache
+    k.delete_calendar_subscription(conn, sub["id"])
+    assert k.get_calendar_subscriptions(conn) == []
+
+
+def test_external_items_expand_recurrence_and_all_day(conn):
+    from datetime import date
+    sub = k.add_calendar_subscription(conn, "Work", "https://example.com/a.ics")
+    k.set_calendar_fetch_result(conn, sub["id"], ICS)
+    items = k.get_external_calendar_items(conn, date(2026, 1, 1), date(2026, 1, 31))
+    standups = [i for i in items if i["title"] == "Standup"]
+    assert [i["start"] for i in standups] == ["2026-01-05", "2026-01-12", "2026-01-19"]
+    assert standups[0]["time"] == "09:00–10:00"
+    trip = next(i for i in items if i["title"] == "Trip")
+    assert (trip["start"], trip["end"]) == ("2026-01-10", "2026-01-12")  # DTEND exclusive
+    assert trip["location"] == "Paris" and trip["kind"] == "external"
+    assert next(i for i in items if i["title"] == "Called off")["cancelled"]
+    # range filtering
+    assert [i["title"] for i in k.get_external_calendar_items(conn, date(2026, 1, 11), date(2026, 1, 11))] == ["Trip"]
+    # disabled subscriptions vanish
+    k.update_calendar_subscription(conn, sub["id"], "Work", sub["url"], sub["color"], False)
+    assert k.get_external_calendar_items(conn, date(2026, 1, 1), date(2026, 1, 31)) == []
+
+
+def test_bad_feed_is_skipped_and_flagged(conn):
+    from datetime import date
+    sub = k.add_calendar_subscription(conn, "Bad", "https://example.com/a.ics")
+    k.set_calendar_fetch_result(conn, sub["id"], "BEGIN:VCALENDAR\nBEGIN:VEVENT\nDTSTART:garbage\nEND:VEVENT\nEND:VCALENDAR")
+    assert k.get_external_calendar_items(conn, date(2026, 1, 1), date(2026, 1, 31)) == []
+
+
+def test_fetch_ics_text_over_http(tmp_path):
+    import functools, http.server, threading
+    (tmp_path / "ok.ics").write_text(ICS)
+    (tmp_path / "html.ics").write_text("<html>nope</html>")
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(tmp_path))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        assert "BEGIN:VCALENDAR" in k.fetch_ics_text(f"{base}/ok.ics")
+        with pytest.raises(ValueError, match="iCalendar"):
+            k.fetch_ics_text(f"{base}/html.ics")
+        with pytest.raises(ValueError, match="404"):
+            k.fetch_ics_text(f"{base}/missing.ics")
+    finally:
+        server.shutdown()
+    with pytest.raises(ValueError, match="Could not reach"):
+        k.fetch_ics_text("http://127.0.0.1:1/x.ics", timeout=2)
