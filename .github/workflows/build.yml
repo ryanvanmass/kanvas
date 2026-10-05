@@ -1,0 +1,107 @@
+name: Build
+
+# Builds the Windows .exe and the Linux .deb/.rpm with the same PyInstaller
+# and fpm steps the README documents. Runs when a version tag (v1.2.3) is
+# pushed - which also publishes a GitHub Release - or on demand from the
+# Actions tab, where the artifacts can be downloaded from the run page.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  QT_LIBS: libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y $QT_LIBS
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest -v
+
+  windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install PySide6 icalendar recurring-ical-events pyinstaller
+      - name: Build kanvas.exe
+        shell: bash
+        run: pyinstaller --onefile --windowed --name kanvas --icon assets/kanvas_logo.ico --add-data "assets;assets" kanvas.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kanvas-windows
+          path: dist/kanvas.exe
+          if-no-files-found: error
+
+  linux:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y $QT_LIBS ruby ruby-dev build-essential rpm
+      - run: pip install PySide6 icalendar recurring-ical-events pyinstaller
+      - run: sudo gem install --no-document fpm
+      - name: Build the app folder
+        run: pyinstaller --onedir --windowed --name kanvas --add-data "assets:assets" kanvas.py
+      # A frozen app can build fine and still crash on startup (missing
+      # bundled files, hidden imports), so launch it headless: surviving
+      # until the timeout kills it (exit 124) means it started.
+      - name: Smoke-test the built app
+        run: |
+          export HOME="$(mktemp -d)" QT_QPA_PLATFORM=offscreen
+          set +e
+          timeout 10 dist/kanvas/kanvas
+          status=$?
+          if [ "$status" -ne 124 ]; then
+            echo "Built app exited early with status $status" >&2
+            exit 1
+          fi
+      - name: Work out the package version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=0.0.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Package .deb and .rpm
+        run: |
+          mkdir packages
+          fpm -s dir -t deb -n kanvas -v "${{ steps.version.outputs.value }}" --prefix /opt/kanvas -C dist/kanvas -p packages/ .
+          fpm -s dir -t rpm -n kanvas -v "${{ steps.version.outputs.value }}" --prefix /opt/kanvas -C dist/kanvas -p packages/ .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kanvas-linux
+          path: packages/*
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

@@ -1,0 +1,4 @@
+PySide6
+icalendar
+recurring-ical-events
+pytest

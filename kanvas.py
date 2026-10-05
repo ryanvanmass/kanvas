@@ -36,7 +36,7 @@ import urllib.error
 from datetime import datetime, date, timedelta, time as dt_time
 
 from PySide6.QtCore import Qt, QRect, QPoint, QDate, QTime, QDateTime, QTimer, QObject, Signal, QPropertyAnimation, QEasingCurve, QUrl
-from PySide6.QtGui import QIcon, QAction, QFont, QColor, QCursor, QPainter, QPen, QBrush, QFontMetrics, QDesktopServices
+from PySide6.QtGui import QIcon, QAction, QFont, QColor, QTextDocument, QCursor, QPainter, QPen, QBrush, QFontMetrics, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QListView, QComboBox,
@@ -44,7 +44,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QDateEdit, QSpinBox, QMenu, QToolButton, QStackedWidget,
     QDateTimeEdit, QTimeEdit, QRadioButton, QButtonGroup, QSystemTrayIcon,
     QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea, QGridLayout, QSizePolicy,
-    QStyledItemDelegate, QTabWidget, QFileDialog, QProgressBar, QStyleOptionViewItem,
+    QStyledItemDelegate, QTabWidget, QFileDialog, QProgressBar, QFrame, QStyleOptionViewItem,
     QColorDialog,
 )
 
@@ -202,6 +202,27 @@ def _migrate_task_cancelled_fields(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN cancelled_note TEXT NOT NULL DEFAULT ''")
         if not _table_has_column(conn, table, "cancelled_at"):
             conn.execute(f"ALTER TABLE {table} ADD COLUMN cancelled_at TEXT NOT NULL DEFAULT ''")
+    conn.commit()
+
+
+def _migrate_notes_to_timeline(conn: sqlite3.Connection) -> None:
+    """Moves each task's legacy single "notes" text into the timeline as
+    its first entry (stamped with the task's own creation time), then
+    clears the legacy column. Idempotent: a task whose notes are already
+    empty is skipped, so re-running does nothing."""
+    for tasks_table, notes_table, created_col in (
+        ("tasks", "task_notes", "created"),
+        ("project_tasks", "project_task_notes", "created_at"),
+    ):
+        if not (_table_exists(conn, tasks_table) and _table_has_column(conn, tasks_table, "notes")):
+            continue
+        rows = conn.execute(
+            f"SELECT id, notes, {created_col} AS created FROM {tasks_table} "
+            "WHERE COALESCE(notes, '') != ''"
+        ).fetchall()
+        for row in rows:
+            _insert_note(conn, notes_table, row["id"], row["notes"], row["created"] or _now())
+            conn.execute(f"UPDATE {tasks_table} SET notes = '' WHERE id = ?", (row["id"],))
     conn.commit()
 
 
@@ -499,12 +520,27 @@ def init_db(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL
         )
     """)
+    # Timeline notes (one row per posted note) - replaces the old single
+    # free-text "notes" column on tasks/project_tasks, which is only kept
+    # for databases created before this existed (see
+    # _migrate_notes_to_timeline).
+    for notes_table in ("task_notes", "project_task_notes"):
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {notes_table} (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                edited_at TEXT NOT NULL DEFAULT ''
+            )
+        """)
     conn.commit()
 
     _migrate_legacy_single_board_schema(conn)
     _migrate_task_card_fields(conn)
     _migrate_task_completion_fields(conn)
     _migrate_task_cancelled_fields(conn)
+    _migrate_notes_to_timeline(conn)
 
     # Fresh install: no boards exist yet at all (migration only runs for
     # upgrades, so this is the true "never used before" case).
@@ -582,6 +618,11 @@ def delete_board(conn: sqlite3.Connection, board_id: str) -> None:
         "DELETE FROM task_tags WHERE task_id IN (SELECT id FROM tasks WHERE board_id = ?)",
         (board_id,),
     )
+    for child_table in ("subtasks", "task_notes"):
+        conn.execute(
+            f"DELETE FROM {child_table} WHERE task_id IN (SELECT id FROM tasks WHERE board_id = ?)",
+            (board_id,),
+        )
     conn.execute("DELETE FROM tasks WHERE board_id = ?", (board_id,))
     conn.execute("DELETE FROM columns WHERE board_id = ?", (board_id,))
     conn.execute(
@@ -852,6 +893,31 @@ def set_task_tags(
     )
 
 
+# -- Timeline notes (shared by standard tasks and project tasks) ------------
+
+def _insert_note(conn: sqlite3.Connection, notes_table: str, task_id: str, body: str, created_at: str = None) -> dict:
+    note_id = uuid.uuid4().hex
+    conn.execute(
+        f"INSERT INTO {notes_table} (id, task_id, body, created_at, edited_at) VALUES (?, ?, ?, ?, '')",
+        (note_id, task_id, body, created_at or _now()),
+    )
+    conn.commit()
+    return dict(conn.execute(f"SELECT * FROM {notes_table} WHERE id = ?", (note_id,)).fetchone())
+
+
+def _get_notes(conn: sqlite3.Connection, notes_table: str, task_id: str) -> list:
+    """Newest first; rowid breaks ties between notes posted in the same second."""
+    rows = conn.execute(
+        f"SELECT * FROM {notes_table} WHERE task_id = ? ORDER BY created_at DESC, rowid DESC", (task_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _note_snippet(body: str, limit: int = 60) -> str:
+    flat = " ".join(body.split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
 # -- Tasks (looked up by their own id once created; add/list need board_id) --
 
 def add_task(
@@ -866,11 +932,14 @@ def add_task(
     task_id = uuid.uuid4().hex
     now = _now()
     conn.execute(
-        "INSERT INTO tasks (id, board_id, title, notes, status, created, updated, due_date, joplin_link) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (task_id, board_id, title, notes, status, now, now, due_date, joplin_link),
+        "INSERT INTO tasks (id, board_id, title, status, created, updated, due_date, joplin_link) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (task_id, board_id, title, status, now, now, due_date, joplin_link),
     )
     conn.commit()
+    if notes.strip():
+        # "notes" is the task's initial timeline entry - not separately logged.
+        _insert_note(conn, "task_notes", task_id, notes.strip(), now)
     task = get_task(conn, task_id)
     _log_board_task_event(conn, task, "created", f'Created "{title}"')
     return task
@@ -893,14 +962,13 @@ def update_task(
     conn: sqlite3.Connection,
     task_id: str,
     title: str,
-    notes: str,
     due_date: str = "",
     joplin_link: str = "",
 ) -> None:
     old_task = get_task(conn, task_id)
     conn.execute(
-        "UPDATE tasks SET title = ?, notes = ?, due_date = ?, joplin_link = ?, updated = ? WHERE id = ?",
-        (title, notes, due_date, joplin_link, _now(), task_id),
+        "UPDATE tasks SET title = ?, due_date = ?, joplin_link = ?, updated = ? WHERE id = ?",
+        (title, due_date, joplin_link, _now(), task_id),
     )
     conn.commit()
 
@@ -908,7 +976,7 @@ def update_task(
         return
     new_task = get_task(conn, task_id)
     # One entry per changed field, same as the Projects log.
-    for field_name in ("title", "notes", "due_date", "joplin_link"):
+    for field_name in ("title", "due_date", "joplin_link"):
         old_value = old_task.get(field_name) or ""
         new_value = new_task.get(field_name) or ""
         if old_value == new_value:
@@ -1045,6 +1113,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> None:
     conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
     conn.execute("DELETE FROM subtasks WHERE task_id = ?", (task_id,))
     conn.execute("DELETE FROM task_tags WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_notes WHERE task_id = ?", (task_id,))
     conn.commit()
 
 
@@ -1106,6 +1175,47 @@ def delete_subtask(conn: sqlite3.Connection, subtask_id: str) -> None:
         task = get_task(conn, subtask["task_id"])
         if task is not None:
             _log_board_task_event(conn, task, "subtask_removed", f'Removed subtask "{subtask["title"]}"')
+
+
+# -- Timeline notes on a standard task --------------------------------------
+
+def get_task_notes(conn: sqlite3.Connection, task_id: str) -> list:
+    return _get_notes(conn, "task_notes", task_id)
+
+
+def add_task_note(conn: sqlite3.Connection, task_id: str, body: str) -> dict:
+    body = body.strip()
+    if not body:
+        raise ValueError("Note cannot be empty.")
+    note = _insert_note(conn, "task_notes", task_id, body)
+    task = get_task(conn, task_id)
+    if task is not None:
+        _log_board_task_event(conn, task, "note_added", f'Added note: "{_note_snippet(body)}"')
+    return note
+
+
+def update_task_note(conn: sqlite3.Connection, note_id: str, body: str) -> None:
+    body = body.strip()
+    if not body:
+        raise ValueError("Note cannot be empty.")
+    note = conn.execute("SELECT * FROM task_notes WHERE id = ?", (note_id,)).fetchone()
+    if note is None or note["body"] == body:
+        return
+    conn.execute("UPDATE task_notes SET body = ?, edited_at = ? WHERE id = ?", (body, _now(), note_id))
+    conn.commit()
+    task = get_task(conn, note["task_id"])
+    if task is not None:
+        _log_board_task_event(conn, task, "note_edited", f'Edited note: "{_note_snippet(body)}"')
+
+
+def delete_task_note(conn: sqlite3.Connection, note_id: str) -> None:
+    note = conn.execute("SELECT * FROM task_notes WHERE id = ?", (note_id,)).fetchone()
+    conn.execute("DELETE FROM task_notes WHERE id = ?", (note_id,))
+    conn.commit()
+    if note is not None:
+        task = get_task(conn, note["task_id"])
+        if task is not None:
+            _log_board_task_event(conn, task, "note_deleted", f'Deleted note: "{_note_snippet(note["body"])}"')
 
 
 # -- Task templates (per-board presets that prefill the New Task dialog) ----
@@ -2006,7 +2116,7 @@ def clone_board_subtree(
 ) -> dict:
     """Recursively clones a board - its columns, starter tasks, and any
     sub-boards owned by those tasks - into target_project_id. Only title/
-    notes/link are copied onto each cloned task, not start/due dates,
+    notes (the whole timeline, restamped)/link are copied onto each cloned task, not start/due dates,
     completed status, or subtasks: a clone is meant to seed fresh work,
     not replay one project's specific schedule or progress. Columns are
     copied by name/order rather than falling back to
@@ -2035,9 +2145,11 @@ def clone_board_subtree(
         if new_column_id is None:
             continue
         new_task = add_project_task(
-            conn, new_board["id"], new_column_id, task["title"],
-            notes=task.get("notes") or "", link=task.get("link") or "",
+            conn, new_board["id"], new_column_id, task["title"], link=task.get("link") or "",
         )
+        # Oldest first, so the clone's timeline reads in the same order.
+        for note in reversed(get_project_task_notes(conn, task["id"])):
+            _insert_note(conn, "project_task_notes", new_task["id"], note["body"])
         source_subboard = get_subboard_for_task(conn, task["id"])
         if source_subboard is not None:
             clone_board_subtree(conn, source_subboard["id"], target_project_id, new_task["id"])
@@ -2097,6 +2209,12 @@ def delete_project_board(conn: sqlite3.Connection, board_id: str) -> None:
         f"(SELECT id FROM project_tasks WHERE board_id IN ({placeholders}))",
         board_ids,
     )
+    for child_table in ("project_subtasks", "project_task_notes"):
+        conn.execute(
+            f"DELETE FROM {child_table} WHERE task_id IN "
+            f"(SELECT id FROM project_tasks WHERE board_id IN ({placeholders}))",
+            board_ids,
+        )
     conn.execute(f"DELETE FROM project_tasks WHERE board_id IN ({placeholders})", board_ids)
     conn.execute(f"DELETE FROM project_columns WHERE board_id IN ({placeholders})", board_ids)
     conn.execute(f"DELETE FROM project_boards WHERE id IN ({placeholders})", board_ids)
@@ -2210,14 +2328,18 @@ def add_project_task(
     next_position = (max_position_row["m"] + 1) if max_position_row["m"] is not None else 0
 
     task_id = uuid.uuid4().hex
+    now = _now()
     conn.execute(
         "INSERT INTO project_tasks "
-        "(id, board_id, column_id, title, notes, start_date, due_date, completed, position, link, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
-        (task_id, board_id, column_id, title, notes, start_date or None, due_date or None,
-         next_position, link, _now()),
+        "(id, board_id, column_id, title, start_date, due_date, completed, position, link, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+        (task_id, board_id, column_id, title, start_date or None, due_date or None,
+         next_position, link, now),
     )
     conn.commit()
+    if notes.strip():
+        # "notes" is the task's initial timeline entry - not separately logged.
+        _insert_note(conn, "project_task_notes", task_id, notes.strip(), now)
     task = get_project_task(conn, task_id)
     _log_task_event(conn, task, "created", f'Created "{title}"')
     return task
@@ -2395,7 +2517,7 @@ def build_project_task_meta_parts(conn: sqlite3.Connection, task: dict) -> list:
 
 
 def update_project_task(
-    conn: sqlite3.Connection, task_id: str, title: str, notes: str,
+    conn: sqlite3.Connection, task_id: str, title: str,
     start_date: str, due_date: str, link: str,
 ) -> None:
     title = title.strip()
@@ -2404,8 +2526,8 @@ def update_project_task(
 
     old_task = get_project_task(conn, task_id)
     conn.execute(
-        "UPDATE project_tasks SET title = ?, notes = ?, start_date = ?, due_date = ?, link = ? WHERE id = ?",
-        (title, notes, start_date or None, due_date or None, link, task_id),
+        "UPDATE project_tasks SET title = ?, start_date = ?, due_date = ?, link = ? WHERE id = ?",
+        (title, start_date or None, due_date or None, link, task_id),
     )
     conn.commit()
 
@@ -2414,7 +2536,7 @@ def update_project_task(
     new_task = get_project_task(conn, task_id)
     # One log entry per changed field, per the issue's §9.1 ("a single
     # edit that changes both title and due date produces two entries").
-    for field_name in ("title", "notes", "start_date", "due_date", "link"):
+    for field_name in ("title", "start_date", "due_date", "link"):
         old_value = old_task.get(field_name) or ""
         new_value = new_task.get(field_name) or ""
         if old_value == new_value:
@@ -2507,6 +2629,7 @@ def delete_project_task(conn: sqlite3.Connection, task_id: str) -> None:
         delete_project_board(conn, subboard["id"])
     conn.execute("DELETE FROM project_subtasks WHERE task_id = ?", (task_id,))
     conn.execute("DELETE FROM project_task_tags WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM project_task_notes WHERE task_id = ?", (task_id,))
     conn.execute("DELETE FROM project_tasks WHERE id = ?", (task_id,))
     conn.commit()
 
@@ -2576,6 +2699,47 @@ def delete_project_subtask(conn: sqlite3.Connection, subtask_id: str) -> None:
             _log_task_event(conn, task, "subtask_removed", f'Removed subtask "{subtask["title"]}"')
 
 
+# -- Timeline notes on a project task ---------------------------------------
+
+def get_project_task_notes(conn: sqlite3.Connection, task_id: str) -> list:
+    return _get_notes(conn, "project_task_notes", task_id)
+
+
+def add_project_task_note(conn: sqlite3.Connection, task_id: str, body: str) -> dict:
+    body = body.strip()
+    if not body:
+        raise ValueError("Note cannot be empty.")
+    note = _insert_note(conn, "project_task_notes", task_id, body)
+    task = get_project_task(conn, task_id)
+    if task is not None:
+        _log_task_event(conn, task, "note_added", f'Added note: "{_note_snippet(body)}"')
+    return note
+
+
+def update_project_task_note(conn: sqlite3.Connection, note_id: str, body: str) -> None:
+    body = body.strip()
+    if not body:
+        raise ValueError("Note cannot be empty.")
+    note = conn.execute("SELECT * FROM project_task_notes WHERE id = ?", (note_id,)).fetchone()
+    if note is None or note["body"] == body:
+        return
+    conn.execute("UPDATE project_task_notes SET body = ?, edited_at = ? WHERE id = ?", (body, _now(), note_id))
+    conn.commit()
+    task = get_project_task(conn, note["task_id"])
+    if task is not None:
+        _log_task_event(conn, task, "note_edited", f'Edited note: "{_note_snippet(body)}"')
+
+
+def delete_project_task_note(conn: sqlite3.Connection, note_id: str) -> None:
+    note = conn.execute("SELECT * FROM project_task_notes WHERE id = ?", (note_id,)).fetchone()
+    conn.execute("DELETE FROM project_task_notes WHERE id = ?", (note_id,))
+    conn.commit()
+    if note is not None:
+        task = get_project_task(conn, note["task_id"])
+        if task is not None:
+            _log_task_event(conn, task, "note_deleted", f'Deleted note: "{_note_snippet(note["body"])}"')
+
+
 def get_project_task_count(conn: sqlite3.Connection, project_id: str) -> int:
     """Total tasks across a whole project's board tree - used by the
     delete-project confirmation, mirroring get_board_task_count()."""
@@ -2639,6 +2803,9 @@ ACTIVITY_ACTION_TYPES = [
     ("subtask_added", "Subtask added"),
     ("subtask_done", "Subtask checked/unchecked"),
     ("subtask_removed", "Subtask removed"),
+    ("note_added", "Note added"),
+    ("note_edited", "Note edited"),
+    ("note_deleted", "Note deleted"),
     ("subboard_created", "Sub-board created"),
     ("cancelled", "Cancelled"),
     ("uncancelled", "Reopened"),
@@ -2649,7 +2816,6 @@ ACTIVITY_ACTION_TYPES = [
 
 _ACTIVITY_FIELD_LABELS = {
     "title": "Title",
-    "notes": "Notes",
     "start_date": "Start date",
     "due_date": "Due date",
     "link": "Link",
@@ -2768,7 +2934,6 @@ def get_activity_log_board_paths(conn: sqlite3.Connection, project_id: str) -> l
 
 _BOARD_ACTIVITY_FIELD_LABELS = {
     "title": "Title",
-    "notes": "Notes",
     "due_date": "Due date",
     "joplin_link": "Joplin link",
 }
@@ -2793,6 +2958,15 @@ def _log_board_task_event(
         ),
     )
     conn.commit()
+
+
+def get_board_activity_log_entries_for_task(conn: sqlite3.Connection, task_id: str) -> list:
+    """Per-task History tab - newest first, no filters. Only usable while
+    the task still exists; a deleted task's entries stay in the board log."""
+    rows = conn.execute(
+        "SELECT * FROM board_activity_log WHERE task_id = ? ORDER BY created_at DESC, rowid DESC", (task_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_board_activity_log_entries(
@@ -3561,13 +3735,184 @@ def apply_card_state(item: QListWidgetItem, task: dict) -> None:
         item.setToolTip(f"{tip}\n{existing}" if existing else tip)
 
 
+def _markdown_to_html(markdown: str) -> str:
+    """Renders Markdown to HTML via Qt, recolouring links: Qt's default
+    link blue is unreadable on the dark theme, and QLabel's own Markdown
+    mode gives no way to change it (it ignores the palette)."""
+    doc = QTextDocument()
+    doc.setMarkdown(markdown)
+    return doc.toHtml().replace("color:#0000ff", "color:#8AB4F8")
+
+
+class _NoteComposerEdit(QTextEdit):
+    """QTextEdit that emits submitted on Ctrl+Enter (plain Enter still
+    inserts a newline, since notes are multi-line Markdown)."""
+    submitted = Signal()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and event.modifiers() & Qt.ControlModifier:
+            self.submitted.emit()
+            return
+        super().keyPressEvent(event)
+
+
+class NotesTimelineWidget(QWidget):
+    """A task's notes as a timeline of individual timestamped entries,
+    newest first, each rendered as Markdown. Shared by standard-board and
+    project task cards - it only knows four callbacks (list/add/update/
+    delete), so each card binds those to its own table's helpers. Like the
+    subtask checklist, every change writes straight to the database as it
+    happens rather than waiting for the card's Save."""
+
+    def __init__(self, list_fn, add_fn, update_fn, delete_fn, parent=None):
+        super().__init__(parent)
+        self._list_fn = list_fn
+        self._add_fn = add_fn
+        self._update_fn = update_fn
+        self._delete_fn = delete_fn
+        self._editing_note_id = None
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self.composer = _NoteComposerEdit()
+        self.composer.setPlaceholderText("Write a note... (Markdown supported, Ctrl+Enter to post)")
+        self.composer.setFixedHeight(90)
+        self.composer.submitted.connect(self._post_note)
+        outer.addWidget(self.composer)
+
+        post_row = QHBoxLayout()
+        post_row.addStretch()
+        post_btn = QPushButton("Post Note")
+        post_btn.setProperty("accent", True)
+        post_btn.clicked.connect(self._post_note)
+        post_row.addWidget(post_btn)
+        outer.addLayout(post_row)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._entries_host = QWidget()
+        self._entries_layout = QVBoxLayout(self._entries_host)
+        self._entries_layout.setContentsMargins(0, 0, 0, 0)
+        self._scroll.setWidget(self._entries_host)
+        outer.addWidget(self._scroll, stretch=1)
+
+        self.refresh()
+
+    def _post_note(self) -> None:
+        body = self.composer.toPlainText().strip()
+        if not body:
+            return
+        self._add_fn(body)
+        self.composer.clear()
+        self.refresh()
+
+    def refresh(self) -> None:
+        while self._entries_layout.count():
+            item = self._entries_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                # hide() first - see KanbanBoard.rebuild_columns for why.
+                widget.hide()
+                widget.deleteLater()
+
+        notes = self._list_fn()
+        if not notes:
+            empty = QLabel("No notes yet.")
+            empty.setStyleSheet("color: #888888;")
+            self._entries_layout.addWidget(empty)
+        for note in notes:
+            self._entries_layout.addWidget(self._build_entry(note))
+        self._entries_layout.addStretch()
+
+    def _build_entry(self, note: dict) -> QWidget:
+        frame = QFrame()
+        frame.setFrameShape(QFrame.StyledPanel)
+        layout = QVBoxLayout(frame)
+
+        header = QHBoxLayout()
+        stamp = note["created_at"].replace("T", " ")
+        if note.get("edited_at"):
+            stamp += f"  ·  edited {note['edited_at'].replace('T', ' ')}"
+        stamp_label = QLabel(stamp)
+        stamp_label.setStyleSheet("color: #888888; font-size: 11px;")
+        # Wrapping lets a long "edited ..." stamp shrink instead of pushing
+        # the Edit/Delete buttons past the card's right edge.
+        stamp_label.setWordWrap(True)
+        header.addWidget(stamp_label)
+        header.addStretch()
+
+        editing = note["id"] == self._editing_note_id
+        if not editing:
+            edit_btn = QPushButton("Edit")
+            edit_btn.setFlat(True)
+            edit_btn.clicked.connect(lambda checked=False, n=note["id"]: self._start_edit(n))
+            header.addWidget(edit_btn)
+            delete_btn = QPushButton("Delete")
+            delete_btn.setFlat(True)
+            delete_btn.setStyleSheet("color: #e05252;")
+            delete_btn.clicked.connect(lambda checked=False, n=note["id"]: self._delete_note(n))
+            header.addWidget(delete_btn)
+        layout.addLayout(header)
+
+        if editing:
+            editor = QTextEdit()
+            editor.setPlainText(note["body"])
+            editor.setFixedHeight(100)
+            layout.addWidget(editor)
+            btn_row = QHBoxLayout()
+            btn_row.addStretch()
+            cancel_btn = QPushButton("Cancel")
+            cancel_btn.clicked.connect(self._cancel_edit)
+            btn_row.addWidget(cancel_btn)
+            save_btn = QPushButton("Save")
+            save_btn.setProperty("accent", True)
+            save_btn.clicked.connect(lambda checked=False, n=note["id"], e=editor: self._save_edit(n, e))
+            btn_row.addWidget(save_btn)
+            layout.addLayout(btn_row)
+        else:
+            body = QLabel(_markdown_to_html(note["body"]))
+            body.setTextFormat(Qt.RichText)
+            body.setWordWrap(True)
+            body.setTextInteractionFlags(Qt.TextBrowserInteraction)
+            body.setOpenExternalLinks(True)
+            layout.addWidget(body)
+        return frame
+
+    def _start_edit(self, note_id: str) -> None:
+        self._editing_note_id = note_id
+        self.refresh()
+
+    def _cancel_edit(self) -> None:
+        self._editing_note_id = None
+        self.refresh()
+
+    def _save_edit(self, note_id: str, editor: QTextEdit) -> None:
+        body = editor.toPlainText().strip()
+        if not body:
+            QMessageBox.warning(self, "Note required", "A note cannot be empty - delete it instead.")
+            return
+        self._update_fn(note_id, body)
+        self._editing_note_id = None
+        self.refresh()
+
+    def _delete_note(self, note_id: str) -> None:
+        reply = QMessageBox.question(
+            self, "Delete note", "Delete this note?", QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self._delete_fn(note_id)
+            self.refresh()
+
+
 class TaskCardDialog(QDialog):
     """Full card view for a single task: title, status/column, due date,
-    Joplin note link, notes, a subtask checklist, and the created/updated
+    Joplin note link, a Notes tab (timeline), a History tab, a subtask checklist, and the created/updated
     timestamps, all in one dialog rather than the separate title-then-notes
     prompts this replaced.
 
-    Title/status/due-date/Joplin-link/notes are only committed if the user
+    Title/status/due-date/Joplin-link are only committed if the user
     clicks Save (standard form semantics), but subtask add/check/delete
     write straight through to the database as they happen — a checklist
     that could be "cancelled" would be surprising, and it avoids having to
@@ -3581,7 +3926,10 @@ class TaskCardDialog(QDialog):
         self.resize(440, 760)
         self.delete_requested = False
 
-        layout = QVBoxLayout(self)
+        outer_layout = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        details_tab = QWidget()
+        layout = QVBoxLayout(details_tab)
 
         layout.addWidget(QLabel("Title"))
         self.title_edit = QLineEdit(task["title"])
@@ -3633,11 +3981,6 @@ class TaskCardDialog(QDialog):
         self.joplin_link_edit.setPlaceholderText("joplin://... or https://...")
         layout.addWidget(self.joplin_link_edit)
 
-        layout.addWidget(QLabel("Notes"))
-        self.notes_edit = QTextEdit()
-        self.notes_edit.setPlainText(task.get("notes") or "")
-        layout.addWidget(self.notes_edit, stretch=1)
-
         layout.addWidget(QLabel("Subtasks"))
         self.subtasks_list = QListWidget()
         self.subtasks_list.itemChanged.connect(self._on_subtask_item_changed)
@@ -3662,6 +4005,30 @@ class TaskCardDialog(QDialog):
         meta_label.setStyleSheet("color: #888888; font-size: 11px;")
         layout.addWidget(meta_label)
 
+        self.tabs.addTab(details_tab, "Details")
+        self.notes_timeline = NotesTimelineWidget(
+            lambda: get_task_notes(self.conn, self.task_id),
+            lambda body: add_task_note(self.conn, self.task_id, body),
+            lambda note_id, body: update_task_note(self.conn, note_id, body),
+            lambda note_id: delete_task_note(self.conn, note_id),
+        )
+        self.tabs.addTab(self.notes_timeline, "Notes")
+
+        history_tab = QWidget()
+        history_layout = QVBoxLayout(history_tab)
+        self.history_table = QTableWidget()
+        self.history_table.setColumnCount(3)
+        self.history_table.setHorizontalHeaderLabels(["Date", "Action", "Description"])
+        self.history_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.history_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.history_table.verticalHeader().setVisible(False)
+        self.history_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        history_layout.addWidget(self.history_table)
+        self.tabs.addTab(history_tab, "History")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self._refresh_history()
+        outer_layout.addWidget(self.tabs)
+
         btn_row = QHBoxLayout()
         delete_btn = QPushButton("Delete")
         delete_btn.setStyleSheet("color: #b00000;")
@@ -3676,13 +4043,31 @@ class TaskCardDialog(QDialog):
         save_btn.setDefault(True)
         save_btn.clicked.connect(self._on_save)
         btn_row.addWidget(save_btn)
-        layout.addLayout(btn_row)
+        outer_layout.addLayout(btn_row)
 
     def _on_save(self) -> None:
         if not self.title_edit.text().strip():
             QMessageBox.warning(self, "Title required", "Task title cannot be empty.")
             return
         self.accept()
+
+    # -- history (read-only; subtasks and notes log as they happen, so
+    # it's reloaded whenever the tab is opened rather than only once) --
+
+    def _on_tab_changed(self, index: int) -> None:
+        if self.tabs.widget(index) is self.history_table.parentWidget():
+            self._refresh_history()
+
+    def _refresh_history(self) -> None:
+        action_labels = dict(ACTIVITY_ACTION_TYPES)
+        entries = get_board_activity_log_entries_for_task(self.conn, self.task_id)
+        self.history_table.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
+            self.history_table.setItem(row, 0, QTableWidgetItem(entry["created_at"]))
+            self.history_table.setItem(
+                row, 1, QTableWidgetItem(action_labels.get(entry["action_type"], entry["action_type"]))
+            )
+            self.history_table.setItem(row, 2, QTableWidgetItem(entry["description"]))
 
     # -- subtasks (write straight to the database, see class docstring) --
 
@@ -3716,7 +4101,7 @@ class TaskCardDialog(QDialog):
         delete_subtask(self.conn, item.data(Qt.UserRole))
         self._refresh_subtasks()
 
-    # -- title/status/due-date/link/notes (only committed on Save) -------
+    # -- title/status/due-date/link (only committed on Save) -------
 
     def _on_delete(self) -> None:
         self.delete_requested = True
@@ -3726,7 +4111,6 @@ class TaskCardDialog(QDialog):
         due_date = self.due_date_edit.date().toString("yyyy-MM-dd") if self.due_date_check.isChecked() else ""
         return {
             "title": self.title_edit.text().strip(),
-            "notes": self.notes_edit.toPlainText().strip(),
             "status": self.status_combo.currentData(),
             "due_date": due_date,
             "joplin_link": self.joplin_link_edit.text().strip(),
@@ -5932,8 +6316,9 @@ class KanbanBoard(QWidget):
                 tooltip_lines = []
                 if task.get("due_date"):
                     tooltip_lines.append(f"Due: {task['due_date']}")
-                if task.get("notes"):
-                    tooltip_lines.append(task["notes"])
+                latest_notes = get_task_notes(self.conn, task["id"])[:1]
+                if latest_notes:
+                    tooltip_lines.append(_note_snippet(latest_notes[0]["body"], 200))
                 if task.get("joplin_link"):
                     tooltip_lines.append(f"Joplin: {task['joplin_link']}")
                 if tooltip_lines:
@@ -6048,7 +6433,7 @@ class KanbanBoard(QWidget):
 
         values = dialog.result_values()
         update_task(
-            self.conn, task_id, values["title"], values["notes"],
+            self.conn, task_id, values["title"],
             values["due_date"], values["joplin_link"],
         )
         if values["status"] and values["status"] != task["status"]:
@@ -6846,11 +7231,6 @@ class ProjectTaskCardDialog(QDialog):
         self.link_edit.setPlaceholderText("https://...")
         details_layout.addWidget(self.link_edit)
 
-        details_layout.addWidget(QLabel("Notes"))
-        self.notes_edit = QTextEdit()
-        self.notes_edit.setPlainText(task.get("notes") or "")
-        details_layout.addWidget(self.notes_edit, stretch=1)
-
         details_layout.addWidget(QLabel("Subtasks"))
         self.subtasks_list = QListWidget()
         self.subtasks_list.itemChanged.connect(self._on_subtask_item_changed)
@@ -6885,6 +7265,14 @@ class ProjectTaskCardDialog(QDialog):
         details_layout.addWidget(meta_label)
 
         self.tabs.addTab(details_tab, "Details")
+
+        self.notes_timeline = NotesTimelineWidget(
+            lambda: get_project_task_notes(self.conn, self.task_id),
+            lambda body: add_project_task_note(self.conn, self.task_id, body),
+            lambda note_id, body: update_project_task_note(self.conn, note_id, body),
+            lambda note_id: delete_project_task_note(self.conn, note_id),
+        )
+        self.tabs.addTab(self.notes_timeline, "Notes")
 
         history_tab = QWidget()
         history_layout = QVBoxLayout(history_tab)
@@ -7005,7 +7393,6 @@ class ProjectTaskCardDialog(QDialog):
     def result_values(self) -> dict:
         return {
             "title": self.title_edit.text().strip(),
-            "notes": self.notes_edit.toPlainText().strip(),
             "column_id": self.column_combo.currentData(),
             "start_date": self.start_date_edit.date().toString("yyyy-MM-dd") if self.start_date_check.isChecked() else "",
             "due_date": self.due_date_edit.date().toString("yyyy-MM-dd") if self.due_date_check.isChecked() else "",
@@ -7183,7 +7570,7 @@ class ProjectKanbanWidget(QWidget):
 
         values = dialog.result_values()
         update_project_task(
-            self.conn, task_id, values["title"], values["notes"],
+            self.conn, task_id, values["title"],
             values["start_date"], values["due_date"], values["link"],
         )
         if values["column_id"] and values["column_id"] != task["column_id"]:
@@ -7448,7 +7835,7 @@ class _ProjectTaskTableView(QWidget):
         new_value = item.text().strip()
         start_date = new_value if item.column() == self.COLUMN_START else (task.get("start_date") or "")
         due_date = new_value if item.column() == self.COLUMN_DUE else (task.get("due_date") or "")
-        update_project_task(self.conn, task_id, task["title"], task["notes"], start_date, due_date, task["link"])
+        update_project_task(self.conn, task_id, task["title"], start_date, due_date, task["link"])
         self.hub.refresh_all_views()
 
 
