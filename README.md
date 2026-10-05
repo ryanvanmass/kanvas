@@ -17,6 +17,12 @@
 - A per-board **Activity Log** records task created/edited/moved/completed/deleted, subtask and note events, with search plus action-type and date filters
 - Per-board task templates, scheduled automation rules (create or move tasks on a schedule), and a summary **Report**
 - **Projects**: separate from boards, with nested sub-boards under any task and Kanban, List, Gantt, and Calendar views, a Document Library, a progress rollup, a project-wide Activity Log, and whole-project duplication
+- Colored tags (one shared list, managed from the "Tags" button) on board and project tasks, with a tag filter on each board
+- Mark a task cancelled with an optional note (hidden by default; use "Show Cancelled" to review them)
+- Right-click a task to mark it cancelled, delete it, or move it to another board (standard boards)
+- Global calendar (Calendar button / side panel) showing every dated task across all boards and projects
+- Subscribe to external read-only calendars (iCalendar/webcal URLs, including recurring events) from the global calendar's "Calendars…" button; feeds refresh in the background and the last download is kept for offline use
+- Back up all data to a single file and restore it later from the toolbar's "Backup" menu; restoring first saves a safety copy of the current data to a `backups/` folder next to the database
 - Global `Ctrl+Space` hotkey opens a quick-add dialog (with a board picker and a "Create multiple" option) from anywhere, even while Kanvas isn't focused
 - Data is stored locally in a SQLite database — no account or internet connection required
 
@@ -24,12 +30,13 @@
 
 - Python 3.9+
 - [PySide6](https://pypi.org/project/PySide6/)
+- [icalendar](https://pypi.org/project/icalendar/) and [recurring-ical-events](https://pypi.org/project/recurring-ical-events/) (only needed for external calendar subscriptions)
 - Windows or Linux (tested on Fedora)
 
 ## Installation
 
 ```bash
-pip install PySide6
+pip install PySide6 icalendar recurring-ical-events
 ```
 
 ## Usage
@@ -86,7 +93,7 @@ The tag (minus the `v`) becomes the package version.
 The steps below are the manual equivalent, using [PyInstaller](https://pyinstaller.org/).
 
 ```bash
-pip install pyinstaller
+pip install icalendar recurring-ical-events pyinstaller
 ```
 
 ### Windows (.exe)

@@ -35,7 +35,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install PySide6 pyinstaller
+      - run: pip install PySide6 icalendar recurring-ical-events pyinstaller
       - name: Build kanvas.exe
         shell: bash
         run: pyinstaller --onefile --windowed --name kanvas --icon assets/kanvas_logo.ico --add-data "assets;assets" kanvas.py
@@ -54,7 +54,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: sudo apt-get update && sudo apt-get install -y $QT_LIBS ruby ruby-dev build-essential rpm
-      - run: pip install PySide6 pyinstaller
+      - run: pip install PySide6 icalendar recurring-ical-events pyinstaller
       - run: sudo gem install --no-document fpm
       - name: Build the app folder
         run: pyinstaller --onedir --windowed --name kanvas --add-data "assets:assets" kanvas.py
