@@ -213,3 +213,72 @@ def test_fetch_ics_text_over_http(tmp_path):
         server.shutdown()
     with pytest.raises(ValueError, match="Could not reach"):
         k.fetch_ics_text("http://127.0.0.1:1/x.ics", timeout=2)
+
+
+def _file_conn(path):
+    c = k.get_connection(str(path))
+    k.init_db(c)
+    return c
+
+
+def test_backup_and_restore_round_trip(tmp_path):
+    live = _file_conn(tmp_path / "live.db")
+    b = k.get_boards(live)[0]
+    k.add_task(live, b["id"], "Keep me")
+    k.add_tag(live, "t1")
+    backup = tmp_path / "snap.db"
+    k.create_backup(live, str(backup))
+    assert k.inspect_backup(str(backup))["tasks"] == 1
+
+    k.add_task(live, b["id"], "Added after backup")
+    k.delete_tag(live, k.get_tags(live)[0]["id"])
+    safety_dir = tmp_path / "safety"
+    safety = k.restore_backup(live, str(backup), str(safety_dir))
+
+    titles = [t["title"] for col in k.get_columns(live, b["id"]) for t in k.get_tasks_by_status(live, b["id"], col["status"])]
+    assert titles == ["Keep me"] and [t["name"] for t in k.get_tags(live)] == ["t1"]
+    # the safety copy holds the pre-restore state, and the live connection still works
+    assert k.inspect_backup(safety)["tasks"] == 2
+    k.add_task(live, b["id"], "Still writable")
+
+
+def test_restore_rejects_bad_files_without_touching_data(tmp_path):
+    live = _file_conn(tmp_path / "live.db")
+    b = k.get_boards(live)[0]
+    k.add_task(live, b["id"], "Safe")
+    junk = tmp_path / "junk.db"
+    junk.write_text("definitely not sqlite")
+    other = tmp_path / "other.db"
+    import sqlite3 as _sq
+    _sq.connect(str(other)).execute("CREATE TABLE unrelated (x)").connection.commit()
+    for bad in (junk, other, tmp_path / "missing.db"):
+        with pytest.raises(ValueError):
+            k.restore_backup(live, str(bad), str(tmp_path / "safety"))
+    with pytest.raises(ValueError):
+        k.restore_backup(live, str(tmp_path / "live.db"), str(tmp_path / "safety"))
+    with pytest.raises(ValueError):
+        k.create_backup(live, str(tmp_path / "live.db"))
+    assert k.get_task(live, k.get_tasks_by_status(live, b["id"], "today")[0]["id"])["title"] == "Safe"
+    assert not (tmp_path / "safety").exists()   # nothing was copied before validation failed
+
+
+def test_restore_migrates_older_backup(tmp_path):
+    import sqlite3 as _sq
+    old = tmp_path / "old.db"
+    raw = _sq.connect(str(old))
+    raw.executescript("""
+        CREATE TABLE boards (id TEXT PRIMARY KEY, name TEXT NOT NULL, position INTEGER NOT NULL, created TEXT NOT NULL);
+        CREATE TABLE columns (board_id TEXT NOT NULL, status TEXT NOT NULL, name TEXT NOT NULL, position INTEGER NOT NULL, PRIMARY KEY (board_id, status));
+        CREATE TABLE tasks (id TEXT PRIMARY KEY, board_id TEXT NOT NULL, title TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL, created TEXT NOT NULL, updated TEXT NOT NULL, due_date TEXT NOT NULL DEFAULT '',
+            joplin_link TEXT NOT NULL DEFAULT '', completed INTEGER NOT NULL DEFAULT 0, completed_at TEXT NOT NULL DEFAULT '');
+        INSERT INTO boards VALUES ('b1','Old board',0,'x');
+        INSERT INTO columns VALUES ('b1','today','Today',0);
+        INSERT INTO tasks VALUES ('t1','b1','Legacy','', 'today','x','x','','',0,'');
+    """)
+    raw.commit(); raw.close()
+    live = _file_conn(tmp_path / "live.db")
+    k.restore_backup(live, str(old), str(tmp_path / "safety"))
+    task = k.get_task(live, "t1")
+    assert task["title"] == "Legacy" and task["cancelled"] == 0
+    k.get_global_calendar_items(live)   # new tables/columns exist after migration

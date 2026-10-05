@@ -3039,6 +3039,118 @@ def get_external_calendar_items(conn: sqlite3.Connection, range_start: date, ran
     return items
 
 
+# -- Backup / restore -----------------------------------------------------
+#
+# A backup is simply a complete, consistent copy of the SQLite database
+# (made with sqlite3's online backup API, so it is safe while the app is
+# running). Restoring copies a backup's contents back INTO the live
+# connection rather than swapping files on disk - the one shared
+# connection every widget holds stays valid, and nothing has to be
+# reopened. Older backups are brought up to date by init_db() afterwards.
+
+BACKUP_REQUIRED_TABLES = ("boards", "columns", "tasks")
+
+
+def get_safety_backup_dir() -> str:
+    path = os.path.join(get_data_dir(), "backups")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _same_file(a: str, b: str) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.abspath(a) == os.path.abspath(b)
+
+
+def create_backup(conn: sqlite3.Connection, dest_path: str) -> None:
+    """Writes a full snapshot of the database to dest_path (overwriting
+    it). Refuses to overwrite the live database file itself."""
+    live_path = next(
+        (row["file"] for row in conn.execute("PRAGMA database_list") if row["name"] == "main"), ""
+    )
+    if live_path and os.path.exists(dest_path) and _same_file(live_path, dest_path):
+        raise ValueError("Choose a different file - that is the live Kanvas database.")
+    conn.commit()
+    tmp_path = dest_path + ".partial"
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+    dest = sqlite3.connect(tmp_path)
+    try:
+        conn.backup(dest)
+    finally:
+        dest.close()
+    # Only replace the destination once the snapshot is complete, so a
+    # failed backup can never clobber an existing good one.
+    os.replace(tmp_path, dest_path)
+
+
+def inspect_backup(path: str) -> dict:
+    """Opens a candidate backup read-only and checks that it is a healthy
+    Kanvas database. Returns {"boards", "tasks", "projects",
+    "project_tasks"} counts for the confirmation prompt; raises
+    ValueError with a user-presentable message otherwise."""
+    if not os.path.isfile(path):
+        raise ValueError("That file does not exist.")
+    try:
+        src = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        src.row_factory = sqlite3.Row
+    except sqlite3.Error as e:
+        raise ValueError(f"Could not open that file: {e}") from e
+    try:
+        try:
+            tables = {r["name"] for r in src.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            missing = [t for t in BACKUP_REQUIRED_TABLES if t not in tables]
+            if missing:
+                raise ValueError("That file is not a Kanvas backup (missing: " + ", ".join(missing) + ").")
+            check = src.execute("PRAGMA integrity_check").fetchone()[0]
+            if check != "ok":
+                raise ValueError(f"That backup file is damaged ({check}).")
+
+            def count(table):
+                return src.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] if table in tables else 0
+            return {
+                "boards": count("boards"), "tasks": count("tasks"),
+                "projects": count("projects"), "project_tasks": count("project_tasks"),
+            }
+        except sqlite3.DatabaseError as e:
+            raise ValueError(f"That file is not a valid Kanvas backup: {e}") from e
+    finally:
+        src.close()
+
+
+def restore_backup(conn: sqlite3.Connection, src_path: str, safety_dir: str = None) -> str:
+    """Replaces ALL current data with the contents of the backup at
+    src_path. First saves a safety copy of the current data into
+    safety_dir (default: the app's backups folder) and returns that
+    copy's path, so a mistaken restore can itself be undone. The backup
+    is validated before anything is touched; if the restore itself fails
+    part-way the safety copy is the way back."""
+    inspect_backup(src_path)
+    live_path = next(
+        (row["file"] for row in conn.execute("PRAGMA database_list") if row["name"] == "main"), ""
+    )
+    if live_path and _same_file(live_path, src_path):
+        raise ValueError("That is the live Kanvas database, not a backup.")
+
+    safety_dir = safety_dir or get_safety_backup_dir()
+    os.makedirs(safety_dir, exist_ok=True)
+    safety_path = os.path.join(
+        safety_dir, "pre-restore-" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".db"
+    )
+    create_backup(conn, safety_path)
+
+    src = sqlite3.connect(f"file:{src_path}?mode=ro", uri=True)
+    try:
+        src.backup(conn)
+    finally:
+        src.close()
+    _PARSED_ICS_CACHE.clear()
+    init_db(conn)   # migrate backups taken by older versions
+    return safety_path
+
+
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
@@ -5397,6 +5509,7 @@ class KanbanBoard(QWidget):
         self._projects_cache = get_projects(self.conn)
         self._open_project_callback = None
         self._open_calendar_callback = None
+        self._data_restored_callback = None
 
         outer = QVBoxLayout(self)
 
@@ -5477,6 +5590,17 @@ class KanbanBoard(QWidget):
         self.edit_board_btn.setToolTip("Show or hide column move/rename/delete controls")
         self.edit_board_btn.toggled.connect(self._on_edit_board_toggled)
         toolbar.addWidget(self.edit_board_btn)
+
+        self.backup_btn = QToolButton()
+        self.backup_btn.setText("Backup")
+        self.backup_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.backup_btn.setPopupMode(QToolButton.InstantPopup)
+        self.backup_btn.setToolTip("Back up all Kanvas data to a file, or restore it from one")
+        backup_menu = QMenu(self.backup_btn)
+        backup_menu.addAction("Back Up Data…").triggered.connect(self.backup_ui)
+        backup_menu.addAction("Restore From Backup…").triggered.connect(self.restore_ui)
+        self.backup_btn.setMenu(backup_menu)
+        toolbar.addWidget(self.backup_btn)
         outer.addLayout(toolbar)
 
         self.columns_layout = QHBoxLayout()
@@ -5567,6 +5691,74 @@ class KanbanBoard(QWidget):
 
     def set_open_project_callback(self, callback) -> None:
         self._open_project_callback = callback
+
+    # -- backup / restore ----------------------------------------------------
+
+    def set_data_restored_callback(self, callback) -> None:
+        """main() injects this so a restore can also reset the Projects
+        page and the global calendar, which this class doesn't know about."""
+        self._data_restored_callback = callback
+
+    def backup_ui(self) -> None:
+        default_name = f"kanvas-backup-{date.today().isoformat()}.db"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Back Up Kanvas Data",
+            os.path.join(os.path.expanduser("~"), default_name),
+            "Kanvas backup (*.db);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            create_backup(self.conn, path)
+        except (ValueError, OSError, sqlite3.Error) as e:
+            QMessageBox.warning(self, "Backup failed", str(e))
+            return
+        QMessageBox.information(self, "Backup complete", f"All Kanvas data was saved to:\n{path}")
+
+    def restore_ui(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Restore Kanvas Data", os.path.expanduser("~"),
+            "Kanvas backup (*.db *.sqlite);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            summary = inspect_backup(path)
+        except ValueError as e:
+            QMessageBox.warning(self, "Cannot restore", str(e))
+            return
+
+        reply = QMessageBox.warning(
+            self, "Restore from backup",
+            "This will REPLACE all current boards, tasks, projects, tags and calendar "
+            "subscriptions with the contents of:\n\n"
+            f"{path}\n\n"
+            f"The backup contains {summary['boards']} board(s), {summary['tasks']} task(s), "
+            f"{summary['projects']} project(s) and {summary['project_tasks']} project task(s).\n\n"
+            "A safety copy of your current data is saved first so this can be undone. Continue?",
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            safety_path = restore_backup(self.conn, path)
+        except (ValueError, OSError, sqlite3.Error) as e:
+            QMessageBox.critical(self, "Restore failed", str(e))
+            return
+
+        self.reload_after_restore()
+        if self._data_restored_callback is not None:
+            self._data_restored_callback()
+        QMessageBox.information(
+            self, "Restore complete",
+            f"Your data was restored.\n\nThe previous data was saved to:\n{safety_path}",
+        )
+
+    def reload_after_restore(self) -> None:
+        """Everything cached from the old database is stale."""
+        self.rebuild_projects_cache()
+        self.rebuild_boards_selector()
+        self._rebuild_tag_filter()
 
     def set_open_calendar_callback(self, callback) -> None:
         self._open_calendar_callback = callback
@@ -8781,6 +8973,14 @@ class ProjectsHub(QWidget):
         last_view = board.get("last_view") if board.get("last_view") in valid_views else self.VIEW_KANBAN
         self.set_view(last_view, persist=False)
 
+    def reset_after_restore(self) -> None:
+        """A restored database may not contain the project/board this hub
+        had open, and load_project() skips reloading when the ids match,
+        so forget them and let the next open start fresh."""
+        self.current_project_id = None
+        self.current_board_id = None
+        self._rebuild_tag_filter()
+
     def refresh_all_views(self) -> None:
         self._rebuild_tag_filter()  # a dialog may have just created a tag
         self.kanban_widget.refresh()
@@ -9231,6 +9431,13 @@ def main():
         central_stack.setCurrentWidget(global_calendar)
 
     board.set_open_calendar_callback(show_global_calendar)
+
+    def after_data_restored() -> None:
+        projects_hub.reset_after_restore()
+        global_calendar.refresh()
+        central_stack.setCurrentWidget(board)
+
+    board.set_data_restored_callback(after_data_restored)
     central_stack.addWidget(board)
     central_stack.addWidget(projects_hub)
     central_stack.addWidget(global_calendar)

@@ -18,6 +18,7 @@
 - Right-click a task to mark it cancelled, delete it, or move it to another board (standard boards)
 - Global calendar (Calendar button / side panel) showing every dated task across all boards and projects
 - Subscribe to external read-only calendars (iCalendar/webcal URLs, including recurring events) from the global calendar's "Calendars…" button; feeds refresh in the background and the last download is kept for offline use
+- Back up all data to a single file and restore it later from the toolbar's "Backup" menu; restoring first saves a safety copy of the current data to a `backups/` folder next to the database
 - Global `Ctrl+Space` hotkey opens a quick-add dialog (with a board picker and a "Create multiple" option) from anywhere, even while Kanvas isn't focused
 - Data is stored locally in a SQLite database — no account or internet connection required
 
