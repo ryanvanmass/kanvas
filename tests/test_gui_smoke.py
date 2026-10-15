@@ -113,3 +113,25 @@ def test_markdown_renders_formatting_and_recolours_links(qapp):
     html = kanvas._markdown_to_html("**bold** [site](https://example.com)")
     assert "font-weight" in html and "https://example.com" in html
     assert "#0000ff" not in html and "#8AB4F8" in html
+
+
+def test_kanban_board_group_by_tag_adds_section_headers(qapp, conn, board_id):
+    from PySide6.QtCore import Qt
+    tag = kanvas.add_tag(conn, "Urgent")
+    tagged = kanvas.add_task(conn, board_id, "Tagged")
+    kanvas.add_task(conn, board_id, "Plain")
+    kanvas.set_task_tags(conn, tagged["id"], [tag["id"]], "board")
+    board = kanvas.KanbanBoard(conn)
+    status = kanvas.get_columns(conn, board_id)[0]["status"]
+    list_widget = board.columns[status].list_widget
+    assert list_widget.count() == 2
+
+    board.group_by_tag_btn.setChecked(True)
+    rows = [list_widget.item(i) for i in range(list_widget.count())]
+    assert [r.text().split("\n")[0] for r in rows] == ["●  Urgent  (1)", "Tagged", "●  Untagged  (1)", "Plain"]
+    assert rows[0].data(Qt.UserRole) is None
+    assert not rows[0].flags() & (Qt.ItemIsSelectable | Qt.ItemIsDragEnabled)
+    list_widget._on_double_click(rows[0])  # header rows are inert
+
+    board.group_by_tag_btn.setChecked(False)
+    assert list_widget.count() == 2

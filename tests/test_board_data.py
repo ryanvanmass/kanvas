@@ -99,3 +99,28 @@ def test_delete_board_removes_its_log_and_notes(conn):
     kanvas.delete_board(conn, other)
     assert conn.execute("SELECT COUNT(*) FROM board_activity_log WHERE board_id = ?", (other,)).fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM task_notes WHERE task_id = ?", (task["id"],)).fetchone()[0] == 0
+
+
+def test_group_tasks_by_tag_orders_groups_and_repeats_multi_tag_tasks(conn, board_id):
+    work = kanvas.add_tag(conn, "Work")
+    home = kanvas.add_tag(conn, "Home")
+    a = kanvas.add_task(conn, board_id, "A")
+    b = kanvas.add_task(conn, board_id, "B")
+    kanvas.add_task(conn, board_id, "C")
+    kanvas.set_task_tags(conn, a["id"], [home["id"]], "board")
+    kanvas.set_task_tags(conn, b["id"], [work["id"], home["id"]], "board")
+    status = kanvas.get_columns(conn, board_id)[0]["status"]
+    tasks = kanvas.get_tasks_by_status(conn, board_id, status)
+
+    groups = kanvas.group_tasks_by_tag(tasks)
+    assert [(tag["name"] if tag else None, [t["title"] for t in ts]) for tag, ts in groups] == [
+        ("Work", ["B"]),
+        ("Home", ["A", "B"]),
+        (None, ["C"]),
+    ]
+
+
+def test_group_tasks_by_tag_omits_untagged_group_when_empty():
+    tag = {"id": "t", "name": "X", "color": "#000", "position": 0}
+    assert kanvas.group_tasks_by_tag([{"title": "A", "tags": [tag]}]) == [(tag, [{"title": "A", "tags": [tag]}])]
+    assert kanvas.group_tasks_by_tag([]) == []

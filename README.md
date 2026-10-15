@@ -17,7 +17,7 @@
 - A per-board **Activity Log** records task created/edited/moved/completed/deleted, subtask and note events, with search plus action-type and date filters
 - Per-board task templates, scheduled automation rules (create or move tasks on a schedule), and a summary **Report**
 - **Projects**: separate from boards, with nested sub-boards under any task and Kanban, List, Gantt, and Calendar views, a Document Library, a progress rollup, a project-wide Activity Log, and whole-project duplication
-- Colored tags (one shared list, managed from the "Tags" button) on board and project tasks, with a tag filter on each board
+- Colored tags (one shared list, managed from the "Tags" button) on board and project tasks, with a tag filter on each board and a "Group by Tag" toggle that splits each board column into one section per tag (plus Untagged; a task with several tags appears under each)
 - Mark a task cancelled with an optional note (hidden by default; use "Show Cancelled" to review them)
 - Right-click a task to mark it cancelled, delete it, or move it to another board (standard boards)
 - Global calendar (Calendar button / side panel) showing every dated task across all boards and projects
