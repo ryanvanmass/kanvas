@@ -1,3 +1,4 @@
+import gc
 import os
 import sqlite3
 
@@ -38,5 +39,15 @@ def project(conn):
 @pytest.fixture(scope="session")
 def qapp():
     from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import QCoreApplication, QEvent
     app = QApplication.instance() or QApplication([])
     yield app
+    # Tear the test widgets down while the app still exists. Left to
+    # interpreter shutdown, Python frees them in arbitrary order after
+    # QApplication, which intermittently segfaults/aborts the run after
+    # every test has passed.
+    for widget in app.topLevelWidgets():
+        widget.close()
+        widget.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    gc.collect()
