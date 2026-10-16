@@ -865,6 +865,25 @@ def _attach_tags(conn: sqlite3.Connection, tasks: list, kind: str) -> list:
     return tasks
 
 
+def group_tasks_by_tag(tasks: list) -> list:
+    """Buckets tasks (with "tags" attached) for the board's "Group by Tag"
+    view: [(tag dict, [tasks]), ...] in tag order, then (None, [untagged
+    tasks]) last. A task with several tags appears in each of their
+    groups; empty groups are left out. Task order within a group is kept."""
+    groups = {}
+    untagged = []
+    for task in tasks:
+        tags = task.get("tags") or []
+        if not tags:
+            untagged.append(task)
+        for tag in tags:
+            groups.setdefault(tag["id"], (tag, []))[1].append(task)
+    ordered = sorted(groups.values(), key=lambda g: (g[0].get("position") or 0, g[0]["name"].lower()))
+    if untagged:
+        ordered.append((None, untagged))
+    return ordered
+
+
 def set_task_tags(
     conn: sqlite3.Connection, task_id: str, tag_ids: list, kind: str = "board",
 ) -> None:
@@ -3449,6 +3468,7 @@ QComboBox QAbstractItemView {{
 # -- Shared tag / cancel widgets (used by both Boards and Projects) -------
 
 TAGS_ROLE = Qt.UserRole + 1   # list of {"name", "color"} dicts on a card's QListWidgetItem
+GROUP_HEADER_ROLE = Qt.UserRole + 2   # header color on a "Group by Tag" section label
 
 
 def _tag_chip_stylesheet(color: str, filled: bool) -> str:
@@ -3665,7 +3685,25 @@ class TaskCardDelegate(QStyledItemDelegate):
             size.setHeight(size.height() + height)
         return size
 
+    def _paint_group_header(self, painter, option, index) -> None:
+        """Section labels are drawn bare (no card frame) so they read as
+        headings rather than as tasks."""
+        color = QColor(index.data(GROUP_HEADER_ROLE))
+        rect = option.rect.adjusted(6, 0, -6, 0)
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(color, 1))
+        painter.drawLine(rect.left(), rect.bottom() - 2, rect.right(), rect.bottom() - 2)
+        font = QFont(option.font)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(rect.adjusted(0, 0, 0, -4), Qt.AlignLeft | Qt.AlignVCenter, index.data(Qt.DisplayRole))
+        painter.restore()
+
     def paint(self, painter, option, index):
+        if index.data(GROUP_HEADER_ROLE):
+            self._paint_group_header(painter, option, index)
+            return
         tags = index.data(TAGS_ROLE) or []
         if not tags:
             super().paint(painter, option, index)
@@ -5496,17 +5534,23 @@ class TaskListWidget(QListWidget):
         self.itemChanged.connect(self._on_item_changed)
         self.setItemDelegate(TaskCardDelegate(self))
 
+    # Group header rows (board "Group by Tag" view) carry no task id.
+
     def _on_double_click(self, item):
         task_id = item.data(Qt.UserRole)
+        if task_id is None:
+            return
         self.board.edit_task(task_id)
 
     def _on_item_changed(self, item: QListWidgetItem) -> None:
         task_id = item.data(Qt.UserRole)
+        if task_id is None:
+            return
         self.board.handle_set_completed(task_id, item.checkState() == Qt.Checked)
 
     def _on_context_menu(self, pos) -> None:
         item = self.itemAt(pos)
-        if item is None:
+        if item is None or item.data(Qt.UserRole) is None:
             return
         self.setCurrentItem(item)
         task_id = item.data(Qt.UserRole)
@@ -5540,7 +5584,7 @@ class TaskListWidget(QListWidget):
             return
 
         item = source.currentItem()
-        if item is None:
+        if item is None or item.data(Qt.UserRole) is None:
             event.ignore()
             return
 
@@ -5890,6 +5934,7 @@ class KanbanBoard(QWidget):
         self.show_completed = False
         self.show_cancelled = False
         self.tag_filter_id = None
+        self.group_by_tag = False
         self._projects_cache = get_projects(self.conn)
         self._open_project_callback = None
         self._open_calendar_callback = None
@@ -5962,6 +6007,15 @@ class KanbanBoard(QWidget):
         self.tag_filter_combo.setToolTip("Only show tasks with this tag")
         self.tag_filter_combo.currentIndexChanged.connect(self._on_tag_filter_changed)
         toolbar.addWidget(self.tag_filter_combo)
+
+        self.group_by_tag_btn = QPushButton("Group by Tag")
+        self.group_by_tag_btn.setCheckable(True)
+        self.group_by_tag_btn.setToolTip(
+            "Split each column into one section per tag (plus Untagged). "
+            "A task with several tags shows up under each of them."
+        )
+        self.group_by_tag_btn.toggled.connect(self._on_group_by_tag_toggled)
+        toolbar.addWidget(self.group_by_tag_btn)
 
         self.manage_tags_btn = QPushButton("Tags")
         self.manage_tags_btn.setToolTip("Create, rename, recolor or delete tags")
@@ -6248,6 +6302,10 @@ class KanbanBoard(QWidget):
         self.show_cancelled = checked
         self.refresh()
 
+    def _on_group_by_tag_toggled(self, checked: bool) -> None:
+        self.group_by_tag = checked
+        self.refresh()
+
     def _rebuild_tag_filter(self) -> None:
         self.tag_filter_combo.blockSignals(True)
         self.tag_filter_combo.clear()
@@ -6287,48 +6345,66 @@ class KanbanBoard(QWidget):
                 and (not self.tag_filter_id or any(tg["id"] == self.tag_filter_id for tg in t["tags"]))
             ]
 
-            for task in tasks:
-                subtasks = get_subtasks(self.conn, task["id"])
-
-                meta_parts = []
-                if task.get("due_date"):
-                    meta_parts.append(f"Due {task['due_date']}")
-                if subtasks:
-                    done_count = sum(1 for s in subtasks if s["done"])
-                    meta_parts.append(f"{done_count}/{len(subtasks)} done")
-                if task.get("joplin_link"):
-                    meta_parts.append("Joplin")
-
-                card_text = task["title"]
-                if meta_parts:
-                    card_text += "\n" + "   ".join(meta_parts)
-
-                item = QListWidgetItem(card_text)
-                item.setData(Qt.UserRole, task["id"])
-                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                item.setCheckState(Qt.Checked if task["completed"] else Qt.Unchecked)
-                if task["completed"]:
-                    font = item.font()
-                    font.setStrikeOut(True)
-                    item.setFont(font)
-                    item.setForeground(QColor("#767676"))
-
-                tooltip_lines = []
-                if task.get("due_date"):
-                    tooltip_lines.append(f"Due: {task['due_date']}")
-                latest_notes = get_task_notes(self.conn, task["id"])[:1]
-                if latest_notes:
-                    tooltip_lines.append(_note_snippet(latest_notes[0]["body"], 200))
-                if task.get("joplin_link"):
-                    tooltip_lines.append(f"Joplin: {task['joplin_link']}")
-                if tooltip_lines:
-                    item.setToolTip("\n".join(tooltip_lines))
-                apply_card_state(item, task)
-
-                list_widget.addItem(item)
+            if self.group_by_tag:
+                for tag, group_tasks in group_tasks_by_tag(tasks):
+                    list_widget.addItem(self._build_group_header_item(tag, len(group_tasks)))
+                    for task in group_tasks:
+                        list_widget.addItem(self._build_card_item(task))
+            else:
+                for task in tasks:
+                    list_widget.addItem(self._build_card_item(task))
 
             list_widget.blockSignals(False)
             col_widget.set_count(len(tasks))
+
+    def _build_group_header_item(self, tag, count: int) -> QListWidgetItem:
+        """A non-selectable, non-draggable section label for the "Group by
+        Tag" view. Its Qt.UserRole stays None, which TaskListWidget uses to
+        tell it apart from a task card."""
+        name = tag["name"] if tag else "Untagged"
+        item = QListWidgetItem(f"●  {name}  ({count})")
+        item.setFlags(Qt.ItemIsEnabled)
+        item.setData(GROUP_HEADER_ROLE, tag["color"] if tag else "#9a9a9a")
+        return item
+
+    def _build_card_item(self, task: dict) -> QListWidgetItem:
+        subtasks = get_subtasks(self.conn, task["id"])
+
+        meta_parts = []
+        if task.get("due_date"):
+            meta_parts.append(f"Due {task['due_date']}")
+        if subtasks:
+            done_count = sum(1 for s in subtasks if s["done"])
+            meta_parts.append(f"{done_count}/{len(subtasks)} done")
+        if task.get("joplin_link"):
+            meta_parts.append("Joplin")
+
+        card_text = task["title"]
+        if meta_parts:
+            card_text += "\n" + "   ".join(meta_parts)
+
+        item = QListWidgetItem(card_text)
+        item.setData(Qt.UserRole, task["id"])
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        item.setCheckState(Qt.Checked if task["completed"] else Qt.Unchecked)
+        if task["completed"]:
+            font = item.font()
+            font.setStrikeOut(True)
+            item.setFont(font)
+            item.setForeground(QColor("#767676"))
+
+        tooltip_lines = []
+        if task.get("due_date"):
+            tooltip_lines.append(f"Due: {task['due_date']}")
+        latest_notes = get_task_notes(self.conn, task["id"])[:1]
+        if latest_notes:
+            tooltip_lines.append(_note_snippet(latest_notes[0]["body"], 200))
+        if task.get("joplin_link"):
+            tooltip_lines.append(f"Joplin: {task['joplin_link']}")
+        if tooltip_lines:
+            item.setToolTip("\n".join(tooltip_lines))
+        apply_card_state(item, task)
+        return item
 
     # -- task operations ------------------------------------------------
 
